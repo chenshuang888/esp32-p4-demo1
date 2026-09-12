@@ -1,0 +1,6 @@
+## IDF Component Manager Manifest File
+## 界面层依赖：LVGL 图形库 + 其与 ESP-IDF 的桥接层
+dependencies:
+  idf: ">=5.3"
+  espressif/esp_lvgl_port: "^2"     # LVGL <-> esp_lcd 桥接（含任务/锁/显示/触摸接入）
+  lvgl/lvgl: "~9.5.0"               # 图形库（锁定 9.x）

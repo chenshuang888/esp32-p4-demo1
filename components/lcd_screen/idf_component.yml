@@ -1,0 +1,9 @@
+## IDF Component Manager Manifest File
+## 屏幕组件依赖（来自 ESP Component Registry）
+dependencies:
+  idf: ">=5.3"
+  espressif/esp_lcd_ek79007: "^2.0.2~1"          # EK79007 MIPI-DSI 面板驱动
+  espressif/esp_lcd_touch_gt911: "^1"            # GT911 触摸驱动
+  espressif/esp_lcd_touch:
+    version: "^1"
+    public: true                                 # 对外头文件暴露了 esp_lcd_touch_handle_t

@@ -1,0 +1,9 @@
+idf_component_register(
+    SRCS
+        "ui.c"
+        "ui_demo.c"
+    INCLUDE_DIRS
+        "include"
+    PRIV_REQUIRES
+        lcd_screen
+)
