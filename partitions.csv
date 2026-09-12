@@ -1,0 +1,8 @@
+# Name,   Type, SubType, Offset,  Size, Flags
+# 参考 Waveshare ESP32-P4-WIFI6-Touch-LCD-7B 厂家分区表
+# (examples/ESP-IDF/09_lvgl_demo_v8/partitions.csv)
+# 32MB flash 布局: app 8M + spiffs 23M
+nvs,      data, nvs,     0x9000,  0x6000,
+phy_init, data, phy,     0xf000,  0x1000,
+factory,  app,  factory, ,        8M,
+storage,  data, spiffs,  ,        23M,
