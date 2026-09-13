@@ -1,0 +1,6 @@
+## IDF Component Manager Manifest File
+## App 内容层需要直接使用 LVGL（画界面）与 esp_lvgl_port（加 LVGL 锁）
+dependencies:
+  idf: ">=5.3"
+  espressif/esp_lvgl_port: "^2"
+  lvgl/lvgl: "~9.5.0"

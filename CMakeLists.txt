@@ -4,5 +4,9 @@
 # CMakeLists in this exact order for cmake to work correctly
 cmake_minimum_required(VERSION 3.16)
 
+# apps 目录与 main 同级（层级较高），不在默认的 components/ 下，
+# 需要显式告诉构建系统去哪里找这个组件
+set(EXTRA_COMPONENT_DIRS apps)
+
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(demo2)
