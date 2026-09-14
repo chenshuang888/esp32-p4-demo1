@@ -15,6 +15,7 @@
 #include "app_manager.h"
 #include "desktop.h"
 #include "app_demo.h"
+#include "clock.h"
 #include "time_service.h"
 
 static const char *TAG = "app";
@@ -50,6 +51,7 @@ void app_main(void)
      * 顺序就是"已装 App 清单"。第 0 个是主页，所以桌面必须第一个。 */
     desktop_register();
     app_demo_register();
+    clock_register();
 
     /* ---- 4. UI 层：接入 LVGL ---- */
     ESP_ERROR_CHECK(ui_init());

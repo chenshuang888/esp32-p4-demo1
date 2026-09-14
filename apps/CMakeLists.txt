@@ -7,8 +7,10 @@ idf_component_register(
     SRCS
         "desktop.c"
         "app_demo.c"
+        "clock.c"
     INCLUDE_DIRS
         "include"
     REQUIRES
         app_manager
+        time_service
 )
