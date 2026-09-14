@@ -1,6 +1,9 @@
 /*
  * 时钟 App
  *
+ * 它只有中间那个时间 —— 标题和返回按钮都由顶部的公共状态栏提供
+ * （ui 组件的 ui_status_bar），所以本 App 里看不到它们。
+ *
  * 和前面两个 App 最大的不同：它需要一个"每秒触发的 LVGL 定时器"。
  *
  * ⚠️ 定时器**不属于任何 screen** —— 它挂在 LVGL 全局的定时器链表上。
@@ -16,6 +19,7 @@
 
 #include "app_manager.h"
 #include "time_service.h"
+#include "ui_status_bar.h"
 
 static const char *TAG = "clock";
 
@@ -45,12 +49,6 @@ static void on_tick(lv_timer_t *timer)
     update_time();
 }
 
-static void on_back_clicked(lv_event_t *e)
-{
-    (void)e;
-    app_manager_go_home();
-}
-
 static void clock_enter(void)
 {
     ESP_LOGI(TAG, "enter");
@@ -59,23 +57,18 @@ static void clock_enter(void)
 
     s_scr = lv_obj_create(NULL);
 
-    lv_obj_t *title = lv_label_create(s_scr);
-    lv_label_set_text(title, "Clock");
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 24);
+    /* 状态栏：标题和返回按钮都由它提供，本 App 只管中间那个时间 */
+    const ui_status_bar_cfg_t bar = {
+        .title     = "Clock App",
+        .show_back = true,
+    };
+    ui_status_bar_apply(&bar);
 
     s_time_label = lv_label_create(s_scr);
     /* 不显式设字体，用 LVGL 默认字体（montserrat_14）——
      * 这样就不用为了这个 App 去开 CONFIG_LV_FONT_MONTSERRAT_48 了。 */
-    lv_obj_align(s_time_label, LV_ALIGN_CENTER, 0, -30);
+    lv_obj_align(s_time_label, LV_ALIGN_CENTER, 0, 0);
     update_time();      /* 先立刻显示一次，不然会空白 1 秒 */
-
-    lv_obj_t *btn_back = lv_button_create(s_scr);
-    lv_obj_set_size(btn_back, 200, 64);
-    lv_obj_align(btn_back, LV_ALIGN_BOTTOM_MID, 0, -40);
-    lv_obj_add_event_cb(btn_back, on_back_clicked, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *lb = lv_label_create(btn_back);
-    lv_label_set_text(lb, "Back");
-    lv_obj_center(lb);
 
     s_timer = lv_timer_create(on_tick, 1000, NULL);   /* 每秒刷新 */
 

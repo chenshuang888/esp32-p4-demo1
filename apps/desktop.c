@@ -18,6 +18,7 @@
 #include "lvgl.h"
 
 #include "app_manager.h"
+#include "ui_status_bar.h"
 
 static const char *TAG = "desktop";
 
@@ -43,9 +44,17 @@ static void desktop_enter(void)
 
     s_scr = lv_obj_create(NULL);      /* 父传 NULL = 独立 screen */
 
+    /* 状态栏：主页没有"回"的地方，所以不显示返回按钮 */
+    const ui_status_bar_cfg_t bar = {
+        .title     = "Desktop",
+        .show_back = false,
+    };
+    ui_status_bar_apply(&bar);
+
     lv_obj_t *title = lv_label_create(s_scr);
     lv_label_set_text(title, "Desktop");
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 24);
+    /* 顶部要给状态栏让出 UI_STATUS_BAR_HEIGHT，否则会被它盖住 */
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, UI_STATUS_BAR_HEIGHT + 24);
 
     /* 列出所有已注册的 App（跳过主页自己） */
     const int count = app_manager_count();
@@ -62,7 +71,7 @@ static void desktop_enter(void)
 
         lv_obj_t *btn = lv_button_create(s_scr);
         lv_obj_set_size(btn, 260, 64);
-        lv_obj_align(btn, LV_ALIGN_TOP_MID, 0, 90 + i * 84);
+        lv_obj_align(btn, LV_ALIGN_TOP_MID, 0, UI_STATUS_BAR_HEIGHT + 90 + i * 84);
         lv_obj_add_event_cb(btn, on_app_clicked, LV_EVENT_CLICKED, (void *)(intptr_t)i);
 
         lv_obj_t *label = lv_label_create(btn);

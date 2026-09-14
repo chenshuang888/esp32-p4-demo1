@@ -13,4 +13,5 @@ idf_component_register(
     REQUIRES
         app_manager
         time_service
+        ui
 )

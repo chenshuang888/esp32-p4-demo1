@@ -1,10 +1,11 @@
 /*
  * 应用入口 —— 只做"编排"：
- *   硬件层 -> 能力层 -> 注册 App -> UI 层 -> 进主页
+ *   硬件层 -> 能力层 -> 注册 App -> UI 层 -> 状态栏 -> 进主页
  *
  * 注意：main 只有"不写 REQUIRES"时才会自动依赖所有组件。本项目 main 显式声明了
  *       REQUIRES（见 main/CMakeLists.txt），所以这里用到的组件都要在那里列出来。
  */
+#include <stdio.h>      /* snprintf：下面的"文本来源"回调要用 */
 #include <time.h>
 
 #include "esp_log.h"
@@ -12,6 +13,7 @@
 #include "lcd_screen_display.h"
 #include "lcd_screen_touch.h"
 #include "ui.h"
+#include "ui_status_bar.h"
 #include "app_manager.h"
 #include "desktop.h"
 #include "app_demo.h"
@@ -19,6 +21,43 @@
 #include "time_service.h"
 
 static const char *TAG = "app";
+
+/*
+ * ===================== 状态栏要用的两个"胶水"函数 =====================
+ *
+ * 状态栏是通用的，它既不知道"时间"是什么，也不知道"返回"会切去哪。
+ * 这两件事由 main 注入进去 —— main 本来就同时依赖 ui 和 time_service，
+ * 让它来当这个中间人，ui 组件就能保持零业务耦合（详见 ui_status_bar.h）。
+ */
+
+/*
+ * 状态栏右侧的文本来源：把 time_service 给的**结构化时间**变成**字符串**。
+ * 格式在这里改就行（例如想带秒就改成 %02d:%02d:%02d），ui 一行都不用动。
+ *
+ * ⚠️ 它是在 LVGL 任务上下文里被调用的，所以里面不要再加 LVGL 锁。
+ */
+static void status_bar_clock_text(char *out, size_t out_size)
+{
+    struct tm now;
+    if (time_service_get(&now) != ESP_OK) {
+        out[0] = '\0';      /* 还没对过时：给空串（状态栏就不显示），而不是显示假时间 */
+        return;
+    }
+    snprintf(out, out_size, "%02d:%02d", now.tm_hour, now.tm_min);
+}
+
+/*
+ * 返回按钮的动作。
+ *
+ * 这里必须包一层：app_manager_go_home() 的类型是 esp_err_t(*)(void)，而状态栏
+ * 的槽位要求 void(*)(void)，两者**不兼容** —— 直接把函数名传过去，编译器会报
+ * incompatible pointer types；就算强转绕过，通过不兼容的函数指针调用也是
+ * 未定义行为（C11 6.3.2.3 第 8 段）。包一层把返回值丢掉才是正确做法。
+ */
+static void status_bar_back(void)
+{
+    app_manager_go_home();
+}
 
 void app_main(void)
 {
@@ -56,6 +95,11 @@ void app_main(void)
     /* ---- 4. UI 层：接入 LVGL ---- */
     ESP_ERROR_CHECK(ui_init());
 
-    /* ---- 5. 进主页 ---- */
+    /* ---- 5. 状态栏：建一份全局的，并把两个外部动作注入进去 ----
+     * 必须在 ui_init() 之后（状态栏要画在 LVGL 上），
+     * 在 go_home() 之前（各 App 进 enter 时就要用状态栏）。 */
+    ESP_ERROR_CHECK(ui_status_bar_init(status_bar_clock_text, status_bar_back));
+
+    /* ---- 6. 进主页 ---- */
     ESP_ERROR_CHECK(app_manager_go_home());
 }

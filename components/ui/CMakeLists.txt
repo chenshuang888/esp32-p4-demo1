@@ -2,6 +2,7 @@ idf_component_register(
     SRCS
         "ui.c"
         "ui_demo.c"
+        "ui_status_bar.c"
     INCLUDE_DIRS
         "include"
     PRIV_REQUIRES
