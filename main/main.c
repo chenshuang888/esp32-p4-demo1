@@ -19,6 +19,7 @@
 #include "app_demo.h"
 #include "clock.h"
 #include "time_service.h"
+#include "kv_store.h"
 
 static const char *TAG = "app";
 
@@ -69,7 +70,11 @@ void app_main(void)
         ESP_LOGW(TAG, "触摸初始化失败，仅运行显示");
     }
 
-    /* ---- 2. 能力层：时间 ---- */
+    /* ---- 2. 能力层：存储 + 时间 ---- */
+
+    /* 存储要先于任何 App 读写之前建好（各 App 的 enter 里就会用到） */
+    ESP_ERROR_CHECK(kv_init());
+
     time_service_init();
 
     /* 对时：由 main 负责把"外部时间源"接进来（组件本身不认识任何时间源）

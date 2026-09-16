@@ -13,6 +13,7 @@ idf_component_register(
     REQUIRES
         app_manager
         time_service
+        kv_store
         ui
         picture
 )
