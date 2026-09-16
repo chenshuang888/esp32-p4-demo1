@@ -14,4 +14,5 @@ idf_component_register(
         app_manager
         time_service
         ui
+        picture
 )

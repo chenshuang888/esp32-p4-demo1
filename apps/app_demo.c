@@ -16,6 +16,7 @@
 
 #include "app_manager.h"
 #include "ui_status_bar.h"
+#include "picture.h"
 
 static const char *TAG = "app_demo";
 
@@ -83,7 +84,7 @@ static void app_demo_leave(void)
 
 static const app_desc_t s_desc = {
     .name  = "Demo",
-    .icon  = "",
+    .icon  = PICTURE_ICON_DEMO,
     .enter = app_demo_enter,
     .leave = app_demo_leave,
 };

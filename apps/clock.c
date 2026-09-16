@@ -20,6 +20,7 @@
 #include "app_manager.h"
 #include "time_service.h"
 #include "ui_status_bar.h"
+#include "picture.h"
 
 static const char *TAG = "clock";
 
@@ -100,7 +101,7 @@ static void clock_leave(void)
 
 static const app_desc_t s_desc = {
     .name  = "Clock",
-    .icon  = "",
+    .icon  = PICTURE_ICON_CLOCK,
     .enter = clock_enter,
     .leave = clock_leave,
 };
