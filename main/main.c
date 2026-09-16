@@ -20,6 +20,7 @@
 #include "clock.h"
 #include "time_service.h"
 #include "kv_store.h"
+#include "sd_card.h"
 
 static const char *TAG = "app";
 
@@ -75,6 +76,12 @@ void app_main(void)
     /* 存储要先于任何 App 读写之前建好（各 App 的 enter 里就会用到） */
     ESP_ERROR_CHECK(kv_init());
 
+    /* SD 卡：失败是**正常情况**（没插卡），所以只告警不 panic ——
+     * 插不插卡不该决定能不能开机。卡不在时由 App 侧自行降级。 */
+    if (sd_card_init() != ESP_OK) {
+        ESP_LOGW(TAG, "SD 卡未挂载，文件功能不可用");
+    }
+
     time_service_init();
 
     /* 对时：由 main 负责把"外部时间源"接进来（组件本身不认识任何时间源）
@@ -82,14 +89,6 @@ void app_main(void)
      * ⚠️ 现在是硬编码一个固定时间用于验证链路（约 2026-01，UTC 秒）。
      *    以后接 SNTP / RTC 芯片时，只改这一处 —— time_service 和 App 都不用动。 */
     time_service_set(1768000000);
-
-    /* 临时验证：确认"对时 + 时区"都生效了（以后可删） */
-    struct tm now;
-    if (time_service_get(&now) == ESP_OK) {
-        ESP_LOGI(TAG, "local time: %04d-%02d-%02d %02d:%02d:%02d",
-                 now.tm_year + 1900, now.tm_mon + 1, now.tm_mday,
-                 now.tm_hour, now.tm_min, now.tm_sec);
-    }
 
     /* ---- 3. 注册 App ----
      * 顺序就是"已装 App 清单"。第 0 个是主页，所以桌面必须第一个。 */

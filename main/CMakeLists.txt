@@ -3,4 +3,4 @@
 #       一旦手写了 REQUIRES，这个自动行为就被关闭，用到什么必须显式列出来。
 idf_component_register(SRCS "main.c"
                     INCLUDE_DIRS "."
-                    REQUIRES ui lcd_screen app_manager apps time_service kv_store)
+                    REQUIRES ui lcd_screen app_manager apps time_service kv_store sd_card)
