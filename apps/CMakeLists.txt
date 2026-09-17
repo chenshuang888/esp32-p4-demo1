@@ -8,6 +8,7 @@ idf_component_register(
         "desktop.c"
         "app_demo.c"
         "clock.c"
+        "camera.c"
     INCLUDE_DIRS
         "include"
     REQUIRES
@@ -16,4 +17,7 @@ idf_component_register(
         kv_store
         ui
         picture
+        usb_camera
+        jpeg_decoder
+        frame_buf
 )

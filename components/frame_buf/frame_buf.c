@@ -17,13 +17,35 @@ struct frame_buf_s {
     SemaphoreHandle_t new_frame;/* 唤醒消费者（binary，只保证"有最新"） */
 };
 
-/* 默认分配器：PSRAM 64B 对齐（驱动 DMA 写要求）。
+/* 默认分配器：PSRAM，按 **L2 cache 行大小** 对齐。
+ *
+ * ⚠️ 这个对齐是**硬要求**，不是调优：
+ *   槽可能要交给 DMA 写（典型是 JPEG 解码器的 RGB565 输出，2DDMA 直接写 PSRAM），
+ *   之后还要 esp_cache_msync() 按 cache 行做失效 —— 所以**地址和长度**都必须是
+ *   cache 行的整数倍。IDF 的 esp_dma_is_buffer_alignment_satisfied() 检查的正是
+ *   lcm(dma_align=4, cache_line)，不满足时解码器直接返回 ESP_ERR_INVALID_ARG：
+ *       "jpeg decode decode_outbuf or out_buffer size is not aligned"
+ *
+ * ⚠️ 所以**不能写死 64** —— demo1 就是 64，因为它的 L2 cache line 是 64B；
+ *    本项目是 CONFIG_CACHE_L2_CACHE_LINE_SIZE = 128（厂家配置）。这个差异正是
+ *    "demo1 能跑、这里跑不了"的全部原因。
+ *
+ * 这里直接取 128 而不做动态查询，是因为 ESP32-P4 的 L2 cache line **只有 64B / 128B
+ * 两档**（见 esp_system/port/soc/esp32p4/Kconfig.cache），128 是上限，取它一定安全。
+ * （能动态查的 esp_cache_get_alignment() 是**私有接口**，声明在
+ *  esp_private/esp_cache_private.h 里，不适合组件使用。）
+ *
  * 释放统一用 heap_caps_free，注入的 allocator 须为 heap_caps 系 */
+#define FB_PSRAM_ALIGN  128
+
 static void *fb_default_alloc(size_t size, size_t *actual)
 {
-    void *p = heap_caps_aligned_alloc(64, size, MALLOC_CAP_SPIRAM);
+    /* 长度也向上对齐（IDF 对输出缓冲的要求）。实际分配可能略大于 slot_size ——
+     * 对生产者/消费者都无害，只是拿到的缓冲比声明的大一点 */
+    const size_t aligned = (size + FB_PSRAM_ALIGN - 1) / FB_PSRAM_ALIGN * FB_PSRAM_ALIGN;
+    void *p = heap_caps_aligned_alloc(FB_PSRAM_ALIGN, aligned, MALLOC_CAP_SPIRAM);
     if (p != NULL && actual != NULL) {
-        *actual = size;
+        *actual = aligned;
     }
     return p;
 }

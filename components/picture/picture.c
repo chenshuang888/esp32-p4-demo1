@@ -32,20 +32,25 @@
  *
  * ===================== 图标是怎么来的 =====================
  *
- * 源图：C:\Users\ChenShuang\Desktop\esp32-p4\原始图片\clock.png  (300x300, 无水印)
- *       C:\Users\ChenShuang\Desktop\esp32-p4\原始图片\demo.webp  (800x800)
+ * 源图：C:\Users\ChenShuang\Desktop\esp32-p4\原始图片\clock.png    (300x300, 无水印)
+ *       C:\Users\ChenShuang\Desktop\esp32-p4\原始图片\demo.webp    (800x800)
+ *       C:\Users\ChenShuang\Desktop\esp32-p4\原始图片\camera.webp  (800x800)
  *
  * 先经过一步"规范尺寸"处理（裁到内容边界 + 把外圈抠成透明）：
  *   cd 原始图片 && python make_icons_square.py
- *   -> 产出 icons_square/clock.png、icons_square/demo.png（96x96 带 alpha）
+ *   -> 产出 icons_square/clock.png、demo.png、camera.png（96x96 带 alpha）
  *   -> 里面用 Pillow 做两件事：① 按 min(R,G,B) 阈值裁到内容边界，让内容铺满 96px
  *      ② 从四角洪水填充，把"和边角连通的白色"抠成透明（图形内部的白色不受影响）
  *   ⚠️ 那两个坑都写在脚本注释里了：源图带水印时阈值法会失效（要改最大连通块）；
  *      Pillow 的 floodfill 阈值是"各通道差之和"，不是单通道差。
+ *   ⚠️ 脚本会打印"裁了多少 px（占原图宽度的百分之几）"，这个数字要顺手看一眼：
+ *      clock 62%、demo 85% 是正常的；camera 只有 37%，因为它是一台横向的相机、
+ *      本来就只占画布中间一小块（阈值切过头的表现是边缘被削平，不是"占比小"）。
  *
  * 再转成 LVGL 格式（源图带 alpha，所以必须用 RGB565A8 才存得下"透明"）：
  *   python managed_components/lvgl__lvgl/scripts/LVGLImage.py --cf RGB565A8 --ofmt C --name picture_icon_clock_data -o components/picture/images <icons_square/clock.png>
  *   python managed_components/lvgl__lvgl/scripts/LVGLImage.py --cf RGB565A8 --ofmt C --name picture_icon_demo_data  -o components/picture/images <icons_square/demo.png>
+ *   python managed_components/lvgl__lvgl/scripts/LVGLImage.py --cf RGB565A8 --ofmt C --name picture_icon_camera_data -o components/picture/images <icons_square/camera.png>
  *   96x96 RGB565A8 = 96*96*3 = 27648 字节/个（2 字节颜色 + 1 字节 alpha）。
  *
  * ==========================================================
@@ -74,6 +79,7 @@ const lv_image_dsc_t *picture_wallpaper(void)
 /* 图标数据同样在 images/ 下，由 LVGLImage.py 生成 */
 extern const lv_image_dsc_t picture_icon_clock_data;
 extern const lv_image_dsc_t picture_icon_demo_data;
+extern const lv_image_dsc_t picture_icon_camera_data;
 
 /*
  * id -> 图标的对照表。
@@ -85,8 +91,9 @@ static const struct {
     const char           *id;
     const lv_image_dsc_t *dsc;
 } S_ICONS[] = {
-    { PICTURE_ICON_CLOCK, &picture_icon_clock_data },
-    { PICTURE_ICON_DEMO,  &picture_icon_demo_data  },
+    { PICTURE_ICON_CLOCK,  &picture_icon_clock_data  },
+    { PICTURE_ICON_DEMO,   &picture_icon_demo_data   },
+    { PICTURE_ICON_CAMERA, &picture_icon_camera_data },
 };
 
 const lv_image_dsc_t *picture_icon(const char *id)

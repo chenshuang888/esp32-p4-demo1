@@ -11,6 +11,7 @@ idf_component_register(
         "images/picture_wallpaper_data.c"
         "images/picture_icon_clock_data.c"
         "images/picture_icon_demo_data.c"
+        "images/picture_icon_camera_data.c"
     INCLUDE_DIRS
         "include"
 )

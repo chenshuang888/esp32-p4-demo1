@@ -39,6 +39,7 @@ const lv_image_dsc_t *picture_wallpaper(void);
  */
 #define PICTURE_ICON_CLOCK  "clock"
 #define PICTURE_ICON_DEMO   "demo"
+#define PICTURE_ICON_CAMERA "camera"
 
 /**
  * @brief 按 id 取图标（96x96，RGB565A8，带透明）
