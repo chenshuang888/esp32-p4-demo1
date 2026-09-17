@@ -8,6 +8,8 @@
 #include <stdio.h>      /* snprintf：下面的"文本来源"回调要用 */
 #include <time.h>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "esp_log.h"
 
 #include "lcd_screen_display.h"
@@ -21,6 +23,8 @@
 #include "time_service.h"
 #include "kv_store.h"
 #include "sd_card.h"
+#include "frame_buf.h"      /* 临时验证用（第一部分） */
+#include "usb_camera.h"     /* 临时验证用（第一部分） */
 
 static const char *TAG = "app";
 
@@ -61,6 +65,50 @@ static void status_bar_back(void)
     app_manager_go_home();
 }
 
+/*
+ * ===================== 临时验证 USB 摄像头（以后可删）=====================
+ *
+ * 为什么需要它：usb_camera 产出的帧**没有人消费就什么都看不见** ——
+ * 你无法判断"USB 枚举成功了吗""帧真的在进来吗"。所以这里起一个临时任务
+ * 当消费者，每秒打一行帧数和帧大小。
+ *
+ * ⚠️ 这是第一部分的验证代码。等相机 App（第二部分）上来，它自然就会消费帧，
+ *    把这个函数和它的 xTaskCreate 一起删掉。
+ * =======================================================================
+ */
+static void usb_camera_temp_probe(void *arg)
+{
+    (void)arg;
+
+    frame_buf_t *fb = usb_camera_get_fb();
+    uint32_t frames = 0;
+    uint32_t last_len = 0;
+    TickType_t t_report = xTaskGetTickCount();
+
+    ESP_LOGI(TAG, "USB 相机探测已启动，等待摄像头接入…");
+
+    for (;;) {
+        /* 等新帧，最多 100ms —— 超时不是为了收帧，是为了让下面的统计有机会跑 */
+        if (frame_buf_wait_new(fb, 100)) {
+            uint32_t len = 0;
+            frame_buf_get_read(fb, &len);
+            frame_buf_read_done(fb);        /* 只统计不消费画面，立刻还槽 */
+            frames++;
+            last_len = len;
+        }
+
+        if (xTaskGetTickCount() - t_report >= pdMS_TO_TICKS(1000)) {
+            /* 没帧就不打（否则没插摄像头时会每秒刷一行垃圾日志） */
+            if (frames > 0) {
+                ESP_LOGI(TAG, "USB 相机: %u 帧/秒, 最近一帧 %u 字节",
+                         (unsigned)frames, (unsigned)last_len);
+            }
+            frames = 0;
+            t_report = xTaskGetTickCount();
+        }
+    }
+}
+
 void app_main(void)
 {
     /* ---- 1. 硬件层：点亮屏 + 起触摸 ---- */
@@ -80,6 +128,15 @@ void app_main(void)
      * 插不插卡不该决定能不能开机。卡不在时由 App 侧自行降级。 */
     if (sd_card_init() != ESP_OK) {
         ESP_LOGW(TAG, "SD 卡未挂载，文件功能不可用");
+    }
+
+    /* ---- 临时：USB 摄像头（第一部分验证，第二部分换成 camera_init()）----
+     * 摄像头是外设：usb_camera_init() 只安装 USB Host + UVC 驱动并起任务，
+     * **插上设备才会开流**，所以初始化成功是常态（不代表已经插了摄像头）。 */
+    if (usb_camera_init() != ESP_OK) {
+        ESP_LOGE(TAG, "USB 摄像头初始化失败");
+    } else {
+        xTaskCreate(usb_camera_temp_probe, "usb_probe", 4096, NULL, 3, NULL);
     }
 
     time_service_init();

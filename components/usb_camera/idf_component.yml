@@ -1,0 +1,3 @@
+## USB Camera 组件依赖：UVC Host 驱动
+dependencies:
+  espressif/usb_host_uvc: "^2.0"

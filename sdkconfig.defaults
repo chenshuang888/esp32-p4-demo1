@@ -44,3 +44,17 @@ CONFIG_LV_DEF_REFR_PERIOD=15
 # 吃的都是这一项 —— 改这里 = 全项目字号一起变。
 # 18 号字体由这个 choice 自动 select 进来（Kconfig 里的 select LV_FONT_MONTSERRAT_18）。
 CONFIG_LV_FONT_DEFAULT_MONTSERRAT_18=y
+
+# ---- USB Host（USB 摄像头 / UVC 需要）----
+# 这两项是 UVC 能不能工作的**前提**，不是调优项：
+#
+# 1) 默认 256 太小。IDF 在 components/usb/Kconfig 里写明
+#    "Device's with configuration descriptors larger than this limit cannot be supported"
+#    —— UVC 设备的配置描述符（VC + VS 接口 + 格式 + 帧描述符）远超 256 字节，
+#    256 会让摄像头**根本枚举不出来**。
+# 2) 视频流是 IN 方向。Balanced 的 IN FIFO 只有 408 字节，Bias IN 给到 600
+#    （代价是 OUT non-periodic 降到 64 字节，我们用不到 OUT）。
+#
+# 取值来自 demo1 的 USB 摄像头工程（同一块板实测可用）。
+CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=4096
+CONFIG_USB_HOST_HW_BUFFER_BIAS_IN=y
