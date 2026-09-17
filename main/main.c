@@ -19,6 +19,7 @@
 #include "app_demo.h"
 #include "clock.h"
 #include "camera.h"
+#include "photo.h"
 #include "time_service.h"
 #include "kv_store.h"
 #include "sd_card.h"
@@ -105,6 +106,7 @@ void app_main(void)
     app_demo_register();
     clock_register();
     camera_register();
+    photo_register();
 
     /* ---- 4. UI 层：接入 LVGL ---- */
     ESP_ERROR_CHECK(ui_init());

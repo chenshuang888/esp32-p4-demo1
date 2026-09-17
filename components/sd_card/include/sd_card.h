@@ -29,6 +29,11 @@ extern "C" {
 /* FATFS 挂载点。挂载后拼上文件名即可访问，如 SD_CARD_MOUNT_POINT "/a.txt" */
 #define SD_CARD_MOUNT_POINT  "/sdcard"
 
+/* 照片目录：拍照（sd_card_save）往里写，相册（photo App）从里读，两边共用这一个定义。
+ * 放在这里而不是某个 App 里，是因为它既不属于拍照也不属于相册，而两边本来就要
+ * 依赖本组件拿挂载点 —— 与其在两边各写一份字面量（demo1 就是三份），不如和挂载点放一起。 */
+#define SD_CARD_PHOTO_DIR    SD_CARD_MOUNT_POINT "/DCIM"
+
 /**
  * @brief 初始化 SD 卡并把 FATFS 挂载到 SD_CARD_MOUNT_POINT
  *

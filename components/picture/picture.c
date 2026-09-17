@@ -34,23 +34,32 @@
  *
  * 源图：C:\Users\ChenShuang\Desktop\esp32-p4\原始图片\clock.png    (300x300, 无水印)
  *       C:\Users\ChenShuang\Desktop\esp32-p4\原始图片\demo.webp    (800x800)
- *       C:\Users\ChenShuang\Desktop\esp32-p4\原始图片\camera.webp  (800x800)
+ *       C:\Users\ChenShuang\Desktop\esp32-p4\原始图片\camera.png   (410x410, 已手工裁掉水印和多余底色)
+ *       C:\Users\ChenShuang\Desktop\esp32-p4\原始图片\photo.webp   (282x282)
  *
  * 先经过一步"规范尺寸"处理（裁到内容边界 + 把外圈抠成透明）：
  *   cd 原始图片 && python make_icons_square.py
- *   -> 产出 icons_square/clock.png、demo.png、camera.png（96x96 带 alpha）
+ *   -> 产出 icons_square/clock.png、demo.png、camera.png、photo.png（96x96 带 alpha）
+ *   -> 顺带更新 icons_square_preview.png：把四张图按真实栅格位置贴到壁纸上，
+ *      加图标后看一眼这张就能确认裁切和对齐对不对
  *   -> 里面用 Pillow 做两件事：① 按 min(R,G,B) 阈值裁到内容边界，让内容铺满 96px
  *      ② 从四角洪水填充，把"和边角连通的白色"抠成透明（图形内部的白色不受影响）
  *   ⚠️ 那两个坑都写在脚本注释里了：源图带水印时阈值法会失效（要改最大连通块）；
  *      Pillow 的 floodfill 阈值是"各通道差之和"，不是单通道差。
  *   ⚠️ 脚本会打印"裁了多少 px（占原图宽度的百分之几）"，这个数字要顺手看一眼：
- *      clock 62%、demo 85% 是正常的；camera 只有 37%，因为它是一台横向的相机、
- *      本来就只占画布中间一小块（阈值切过头的表现是边缘被削平，不是"占比小"）。
+ *      clock 62%、demo 85%、photo 78% 是正常的；camera 是 100% 也不奇怪 ——
+ *      那张源图已经手工裁到图标边界了，脚本只需抠掉四个圆角的底色。
+ *      偏小才是要警惕的方向（阈值切过头 -> 图标边缘被削平）。
+ *   ⚠️ 源图自己要先裁干净再放进来：**不能带水印**。content_bbox() 只看"离白有多远"，
+ *      水印那种深色杂点会被算成内容，外接矩形直接变成整张图（等于没裁）。
+ *      之前那张 camera.jpg 就是反例：底部一条"昵享网 ..."水印带比图标还暗，
+ *      实测 bbox 被拉到 x 15~1014，水印和灰底会一起进图标。
  *
  * 再转成 LVGL 格式（源图带 alpha，所以必须用 RGB565A8 才存得下"透明"）：
  *   python managed_components/lvgl__lvgl/scripts/LVGLImage.py --cf RGB565A8 --ofmt C --name picture_icon_clock_data -o components/picture/images <icons_square/clock.png>
  *   python managed_components/lvgl__lvgl/scripts/LVGLImage.py --cf RGB565A8 --ofmt C --name picture_icon_demo_data  -o components/picture/images <icons_square/demo.png>
  *   python managed_components/lvgl__lvgl/scripts/LVGLImage.py --cf RGB565A8 --ofmt C --name picture_icon_camera_data -o components/picture/images <icons_square/camera.png>
+ *   python managed_components/lvgl__lvgl/scripts/LVGLImage.py --cf RGB565A8 --ofmt C --name picture_icon_photo_data  -o components/picture/images <icons_square/photo.png>
  *   96x96 RGB565A8 = 96*96*3 = 27648 字节/个（2 字节颜色 + 1 字节 alpha）。
  *
  * ==========================================================
@@ -80,6 +89,7 @@ const lv_image_dsc_t *picture_wallpaper(void)
 extern const lv_image_dsc_t picture_icon_clock_data;
 extern const lv_image_dsc_t picture_icon_demo_data;
 extern const lv_image_dsc_t picture_icon_camera_data;
+extern const lv_image_dsc_t picture_icon_photo_data;
 
 /*
  * id -> 图标的对照表。
@@ -94,6 +104,7 @@ static const struct {
     { PICTURE_ICON_CLOCK,  &picture_icon_clock_data  },
     { PICTURE_ICON_DEMO,   &picture_icon_demo_data   },
     { PICTURE_ICON_CAMERA, &picture_icon_camera_data },
+    { PICTURE_ICON_PHOTO,  &picture_icon_photo_data  },
 };
 
 const lv_image_dsc_t *picture_icon(const char *id)

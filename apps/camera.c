@@ -1,19 +1,22 @@
 /*
- * 相机 App —— USB 摄像头预览
+ * 相机 App —— USB 摄像头预览 + 拍照存 SD 卡
  *
- * 就三块：
- *   1. 常驻（camera_init）：usb_camera + jpeg_decoder，进出 App 都不动
- *   2. 界面（camera_enter / camera_leave）：一个 lv_image + 一个 20ms 定时器
- *   3. 刷新（on_refresh）：把解码输出的最新一帧贴上去
+ * 就四块：
+ *   1. 常驻（camera_init）：usb_camera + jpeg_decoder + sd_card_save，进出 App 都不动
+ *   2. 界面（camera_enter / camera_leave）：一个 lv_image + 底部控制条 + 一个 20ms 定时器
+ *   3. 刷新（on_refresh）：把解码输出的最新一帧贴上去；顺手收拍照结果
+ *   4. 拍照（on_shutter_clicked）：只发一个信号，写盘在 sd_card_save 的任务里做
  *
- * 裁剪自 demo1 的 app_camera.c。砍掉的是：自画顶栏、快门/拍照/SD 保存、
- * 自定义字体与配色、圆形按钮。保留下来的是那套**持帧时序**（见 on_refresh）。
+ * 裁剪自 demo1 的 app_camera.c。砍掉的是：自画顶栏、自定义字体与配色、圆形按钮。
+ * 保留下来的是那套**持帧时序**（见 on_refresh）和"保存中冻结预览"的做法。
  *
  * 没插摄像头时会是什么样：frame_buf 的读槽从没被写过，初值指向它 → **一片黑**。
  * 这是刻意从简（App 是验证台，不是产品）；排查时看日志有没有
  * "jpeg_decode: Decoded N frames" 就知道链路通不通。
  */
 #include "camera.h"
+
+#include <stdio.h>
 
 #include "esp_log.h"
 #include "esp_lvgl_port.h"
@@ -24,6 +27,7 @@
 #include "picture.h"
 #include "usb_camera.h"
 #include "jpeg_decode_task.h"
+#include "sd_card_save.h"
 
 static const char *TAG = "camera";
 
@@ -32,15 +36,22 @@ static const char *TAG = "camera";
  * （demo1 用同一个值） */
 #define REFRESH_MS 20
 
+/* 底部控制条高度。预览是 640x480、从状态栏下沿开始（48+480=528），屏幕 600 高，
+ * 正好剩 72px 放这一条，不会压在画面上。 */
+#define CTRL_BAR_H 72
+
 /* ---- 常驻：camera_init 建立，enter/leave 不碰 ---- */
-static jpeg_decode_t *s_jd = NULL;
+static jpeg_decode_t *s_jd         = NULL;
+static bool           s_save_ready = false;   /* 保存任务是否就绪（没就绪时快门不响应） */
 
 /* ---- 界面：enter 建、leave 清 ---- */
 static lv_obj_t      *s_scr        = NULL;
 static lv_obj_t      *s_image      = NULL;
+static lv_obj_t      *s_status     = NULL;    /* 控制条上的状态文字 */
 static lv_image_dsc_t s_dsc;
 static lv_timer_t    *s_timer      = NULL;
 static bool           s_frame_held = false;   /* 是否还压着一个读槽没还 */
+static bool           s_saving     = false;   /* 保存中：预览冻结在按快门那一帧 */
 
 /*
  * 定时器回调。跑在 LVGL 任务里（已持锁），所以里面不要再加 LVGL 锁。
@@ -63,6 +74,23 @@ static void on_refresh(lv_timer_t *timer)
 {
     (void)timer;
 
+    /* ⓪ 先收拍照结果。保存期间预览是冻结的，收到结果才能解冻。
+     *    不等结果就继续刷新的话，"Saved xxx" 这行字会被状态栏立即覆盖掉，白弹。 */
+    sd_save_result_t res;
+    if (sd_card_save_get_result(&res)) {
+        s_saving = false;
+        if (res.ok) {
+            char msg[48];
+            snprintf(msg, sizeof(msg), "Saved %s", res.fname);
+            lv_label_set_text(s_status, msg);
+        } else {
+            lv_label_set_text(s_status, "Save failed");
+        }
+    }
+    if (s_saving) {
+        return;                     /* 保存中：画面停在按快门那一帧 */
+    }
+
     frame_buf_t *fb = jpeg_decode_get_fb(s_jd);
     if (fb == NULL) {
         return;
@@ -84,6 +112,30 @@ static void on_refresh(lv_timer_t *timer)
     s_frame_held = true;
     lv_image_set_src(s_image, &s_dsc);
     lv_obj_invalidate(s_image);
+}
+
+/*
+ * 按快门。这里**只发信号**就返回，扫目录/写文件/fsync 都在 sd_card_save 的任务里。
+ * 直接在这里写的话要占住 LVGL 任务几十毫秒（预览和触摸全停），没必要。
+ *
+ * 保存期间把预览冻住（s_saving），是为了让屏幕上停着的那一帧就是正在存的那一帧 ——
+ * 否则"存下来的和看到的不是同一张"，回头对不上会以为是 bug。
+ */
+static void on_shutter_clicked(lv_event_t *e)
+{
+    (void)e;
+
+    if (s_saving) {
+        return;                     /* 上一张还在写盘 */
+    }
+    if (!s_save_ready) {
+        lv_label_set_text(s_status, "SD save unavailable");
+        return;
+    }
+
+    s_saving = true;
+    lv_label_set_text(s_status, "Saving...");
+    sd_card_save_trigger();
 }
 
 static void camera_enter(void)
@@ -130,6 +182,26 @@ static void camera_enter(void)
      * 手算 (1024-640)/2，这样不用让 apps 依赖 lcd_screen 拿屏幕宽度）。 */
     lv_obj_align(s_image, LV_ALIGN_TOP_MID, 0, UI_STATUS_BAR_HEIGHT);
 
+    /* 底部控制条：快门 + 状态文字。宽度用 lv_pct(100) 而不是屏幕宽度常量，
+     * 理由同上 —— apps 不需要知道屏幕有多宽。 */
+    lv_obj_t *ctrl = lv_obj_create(s_scr);
+    lv_obj_set_size(ctrl, lv_pct(100), CTRL_BAR_H);
+    lv_obj_align(ctrl, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_radius(ctrl, 0, 0);        /* card 样式默认圆角，贴底用直角 */
+
+    lv_obj_t *shutter = lv_button_create(ctrl);
+    lv_obj_set_size(shutter, 120, 48);
+    lv_obj_align(shutter, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_add_event_cb(shutter, on_shutter_clicked, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *shutter_lb = lv_label_create(shutter);
+    lv_label_set_text(shutter_lb, "Shot");
+    lv_obj_center(shutter_lb);
+
+    s_status = lv_label_create(ctrl);
+    lv_obj_align(s_status, LV_ALIGN_LEFT_MID, 16, 0);
+    lv_label_set_text(s_status, s_save_ready ? "" : "SD save unavailable");
+
+    s_saving = false;               /* 上次离开时可能正在保存，重新进来要复位 */
     s_timer = lv_timer_create(on_refresh, REFRESH_MS, NULL);
 
     lv_screen_load(s_scr);
@@ -159,6 +231,7 @@ static void camera_leave(void)
     lv_obj_delete_async(s_scr);
     s_scr = NULL;
     s_image = NULL;
+    s_status = NULL;
     lvgl_port_unlock();
 }
 
@@ -182,6 +255,15 @@ esp_err_t camera_init(void)
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "jpeg_decode_start failed: %s", esp_err_to_name(err));
         return err;
+    }
+
+    /* 保存任务消费解码器的 JPEG 原数据输出缓冲（jbuf），与解码器同寿命。
+     * 失败**不算** camera_init 失败：预览和拍照是两件独立的事，少了拍照不该
+     * 让整个 App 打不开 —— 界面会把快门标成不可用（见 s_save_ready）。 */
+    if (sd_card_save_init(jpeg_decode_get_jbuf(s_jd)) != ESP_OK) {
+        ESP_LOGE(TAG, "sd_card_save_init failed, 拍照保存不可用");
+    } else {
+        s_save_ready = true;
     }
     return ESP_OK;
 }

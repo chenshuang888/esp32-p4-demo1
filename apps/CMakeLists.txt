@@ -9,6 +9,7 @@ idf_component_register(
         "app_demo.c"
         "clock.c"
         "camera.c"
+        "photo.c"
     INCLUDE_DIRS
         "include"
     REQUIRES
@@ -20,4 +21,6 @@ idf_component_register(
         usb_camera
         jpeg_decoder
         frame_buf
+        sd_card
+        sd_card_save
 )
