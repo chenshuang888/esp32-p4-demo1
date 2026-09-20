@@ -23,8 +23,12 @@ extern "C" {
  * @brief 常驻部分：把相机链路搭起来（USB Host + UVC 驱动 + JPEG 解码器）
  *
  * 由 main 在注册 App 之前调一次，位置和 time_service_init() 同层。
- * **它和界面无关** —— enter/leave 只管界面，进出 App 不会关流、也不会销毁解码器；
- * 否则每次进出都要重新枚举 USB 设备、重建解码引擎。
+ * **它和界面无关** —— enter/leave 只管界面，进出 App 不会销毁解码器、也不会重新
+ * 枚举 USB 设备（那可能要好几秒）。
+ *
+ * 但**推流是单独管的**：设备接入后这里只 open、不 start；推流由 enter/leave 经
+ * usb_camera_stream_request() 按需开关。这样"人在别的 App 里"时，摄像头不占 USB
+ * 带宽、也不跑解码（解码约 15% core1）。详见 usb_camera_stream_request()。
  *
  * @return ESP_OK 成功；其余为 esp_err_t 错误码
  */

@@ -146,6 +146,11 @@ static void camera_enter(void)
         return;
     }
 
+    /* 按需开流：这里只"表达意图"，真正的 start 在 usb_camera 的管理任务里做
+     * （那边和 open/close 同一任务、天然串行；而且 start 里含控制传输和 vTaskDelay，
+     * 不该让 UI 线程去等）。放在 LVGL 锁外，和 app_demo 的"先备数据再动 LVGL"一致。 */
+    usb_camera_stream_request(true);
+
     ESP_LOGI(TAG, "enter");
     lvgl_port_lock(0);
 
@@ -211,6 +216,10 @@ static void camera_enter(void)
 static void camera_leave(void)
 {
     ESP_LOGI(TAG, "leave");
+
+    /* 关流：同样只表达意图。用户已经不看了，就不该继续让摄像头推流、让解码器空跑 */
+    usb_camera_stream_request(false);
+
     lvgl_port_lock(0);
 
     /* ① 定时器挂在 LVGL 全局的定时器链上，**不属于 s_scr** —— 不删的话它会在
