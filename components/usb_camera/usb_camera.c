@@ -17,9 +17,17 @@
 #define USB_CAMERA_TASK_STACK 4096
 #define USB_CAMERA_TASK_PRIO  6
 
-/* UVC 拼帧槽:每槽容量必须 >= 摄像头 dwMaxVideoFrameSize(本机实测 614989),700KB 留裕量。
- * 同一尺寸也用作拷贝目标 frame_buf 的槽 */
-#define UVC_FRAME_BUF_SIZE (700 * 1024)
+/* UVC 拼帧槽（单帧 MJPEG 的最大字节数）。同一尺寸也用作拷贝目标 frame_buf 的槽。
+ *
+ * ⚠️ 这个值必须**实测**，不能照描述符的 dwMaxVideoFrameSize 来定：本机那个值是
+ *    614989，而它在相机的出厂默认格式(1280x720@25)和我们请求的格式(640x480@30)
+ *    下报的是**同一个数** —— 说明它是设备级的保守常量（大概是照最高支持格式算的），
+ *    跟我们实际用的 640x480 没有对应关系。照它分配会过度 8.8 倍。
+ *
+ * 80KB 的依据：40 秒 / 627 帧的极端场景扫描里最大单帧 69704 B（68 KiB），裕量 1.18 倍。
+ *    超了会怎样：驱动报 UVC_HOST_FRAME_BUFFER_OVERFLOW 并丢掉那一帧 —— 不损坏、有
+ *    日志、画面顿一下。所以这个值可以调紧；嫌紧就再跑一次同款扫描看有没有 overflow。 */
+#define UVC_FRAME_BUF_SIZE (80 * 1024)
 #define UVC_FRAME_BUF_NUM  2
 
 /* ---- 事件位：表达"刚刚发生了什么"，和"当前状态"分开 ----
@@ -52,6 +60,7 @@ static volatile bool s_is_streaming = false;   /* 实际：驱动是否正在推
 typedef struct {
     uint8_t     *user_fb[UVC_FRAME_BUF_NUM]; /* uvc 驱动拼帧槽(驱动 user_frame_buffers) */
     frame_buf_t *uvc_fb;                     /* 帧数据落点(生产者=驱动回调,消费者=解码器) */
+    frame_buf_t *jbuf;                       /* 同一份 JPEG 的第二份拷贝(消费者=相机 App 的保存任务) */
 } usb_cam_frame_t;
 
 typedef struct {
@@ -97,7 +106,8 @@ static const uvc_host_stream_config_t s_stream_config = {
         .frame_size = UVC_FRAME_BUF_SIZE,
         .frame_heap_caps = 0,            /* 帧缓冲由 user_frame_buffers 提供,驱动不分配 */
         .number_of_urbs = 3,
-        .urb_size = 10 * 1024,
+        .urb_size = 10 * 1024,           /* 只是提示:驱动会向上取整到 ISOC 包的整数倍
+                                          * (本机实际 4×3072 = 12288,见 uvc_host_install 那段) */
         .user_frame_buffers = s_usb_cam.frame.user_fb, /* 上层指定输出槽数量与位置 */
     },
 };
@@ -189,8 +199,15 @@ static void usb_camera_task(void *arg)
                  s_usb_cam.connect.dev_addr, s_usb_cam.connect.uvc_stream_index);
 
         /* ============ 2. 打开流(必须早做,与 App 无关) ============
-         * 里面可能有最多 5s 的枚举等待,所以不能推到 App 的 enter 里做。
-         * 注意**只 open 不 start**:推流由 App 的 enter 按需触发(见下面占用期)。 */
+         * 注意**只 open 不 start**:推流由 App 的 enter 按需触发(见下面占用期)。
+         *
+         * 为什么 open 不能也推迟到 enter 里？**不是**因为耗时 —— 实测只要 16ms
+         * (uvc_host_stream_open 那个 5000ms 是"等设备出现"的**超时上限**,
+         *  设备已枚举时第一轮就返回)。真正的原因是:
+         *   **UVC 的"设备断开"事件是流级的** —— 驱动级只有 DEVICE_CONNECTED,
+         *   DEV_GONE 只对 uvc_stream_list 里的流发事件。没有流就收不到断开通知,
+         *   device_connected 会说谎,管理任务也就不知道该 close/reopen。
+         * 本机实测时序: initialized(1616) → device connected(2094) → opened(2110)。 */
         uvc_host_stream_hdl_t stream = NULL;
         esp_err_t err = uvc_host_stream_open(&s_stream_config, pdMS_TO_TICKS(5000), &stream);
         if (err != ESP_OK) {
@@ -267,12 +284,19 @@ void usb_camera_stream_request(bool on)
 
 /* ---- 生产者:驱动拼好一帧,直接 memcpy 进 frame_buf 写槽并发布。
  *
+ * 一帧要**扇出成两份**,因为 frame_buf 是单读者(read_in_progress 是一个 bool,
+ * 见 frame_buf.c):一份 frame_buf 只能有一个消费者。两个消费者是:
+ *     uvc_fb -> 解码器 (JPEG -> RGB565 -> 上屏)
+ *     jbuf   -> 相机 App 的保存任务 (原样写进 SD 卡,拍照用)
+ * 所以"一帧给两个人看"必然有一次拷贝 —— 这次拷贝放在这里,换来的是解码器
+ * 从此只管"JPEG 进、RGB565 出",不认识存储。
+ *
  * 跑在驱动后台任务("USB-UVC")里,所以必须够快:
- *     memcpy 一帧(实测 20~80KB)          约 0.2~0.5ms
+ *     两次 memcpy(实测 20~68KiB/帧)      约 0.4~1.0ms
  *   + 被唤醒的消费者(解码器)可能插进来    几十~几百 μs
- *   = 最坏约 1.5ms,而 URB 链路的安全余量约 9.6ms
- *     (3 个 URB 各约 4.8ms 填满,回调期间还有 2 个在排队;见 uvc_host_install
- *      那段的注释)。余量 6 倍以上,而且每帧只发生一次(33ms 一次)。
+ *   = 最坏约 2.5ms,而 URB 链路的安全余量约 23ms
+ *     (单个 URB 约 11.6ms 填满,回调期间还有 2 个在排队;推导见 uvc_host_install
+ *      那段的注释)。余量十几倍,而且每帧只发生一次(实测 15.6fps,约 64ms 一次)。
  *
  * 相比"另起拷贝任务 + 队列"的写法,这里省掉一个常驻任务、一个队列和每帧
  * 一次任务切换;更重要的是**我们从头到尾不持有 UVC 帧** —— 返回 true 之后
@@ -284,25 +308,40 @@ static bool frame_callback(const uvc_host_frame_t *frame, void *user_ctx)
 {
     (void)user_ctx;
 
-    if (frame->data_len <= UVC_FRAME_BUF_SIZE) {
-        uint8_t *slot = frame_buf_get_write(s_usb_cam.frame.uvc_fb);
-        memcpy(slot, frame->data, frame->data_len);
-        frame_buf_commit(s_usb_cam.frame.uvc_fb, frame->data_len);
-    } else {
+    /* 两个槽一样大(UVC_FRAME_BUF_SIZE),所以这一处长度检查同时管住两份拷贝 */
+    if (frame->data_len > UVC_FRAME_BUF_SIZE) {
         ESP_LOGW(TAG, "frame %u exceeds slot %u, dropped",
                  (unsigned)frame->data_len, (unsigned)UVC_FRAME_BUF_SIZE);
+        return true;
     }
+
+    /* ① 给解码器 */
+    uint8_t *slot = frame_buf_get_write(s_usb_cam.frame.uvc_fb);
+    memcpy(slot, frame->data, frame->data_len);
+    frame_buf_commit(s_usb_cam.frame.uvc_fb, frame->data_len);
+
+    /* ② 给 相机 App 的保存任务(拍照)。消费者忙(正在写盘)时 commit 返回 false 自动丢本帧 */
+    uint8_t *jslot = frame_buf_get_write(s_usb_cam.frame.jbuf);
+    memcpy(jslot, frame->data, frame->data_len);
+    frame_buf_commit(s_usb_cam.frame.jbuf, frame->data_len);
 
     return true;    /* 处理完了,所有权立刻还给驱动 */
 }
 
 /* =====================================================================
- * 分区 C：帧缓冲暴露（解码器经此拿到输入 frame_buf 消费 JPEG 帧）
+ * 分区 C：帧缓冲暴露
+ *   uvc_fb -> 解码器（消费 JPEG 帧）
+ *   jbuf   -> 相机 App 的保存任务（拍照时原样写卡）
  * ===================================================================== */
 
 frame_buf_t *usb_camera_get_fb(void)
 {
     return s_usb_cam.frame.uvc_fb;
+}
+
+frame_buf_t *usb_camera_get_jbuf(void)
+{
+    return s_usb_cam.frame.jbuf;
 }
 
 /* =====================================================================
@@ -333,6 +372,19 @@ esp_err_t usb_camera_init(void)
         return ESP_ERR_NO_MEM;
     }
 
+    /* 同一份 JPEG 的第二份拷贝落点:消费者是 相机 App 的保存任务(拍照写 SD 卡)。
+     * 槽大小与 uvc_fb 相同即可 —— 超过 UVC_FRAME_BUF_SIZE 的帧在 frame_callback
+     * 入口就已经丢了,所以这里不需要更大的槽,也不需要再判长度。 */
+    const frame_buf_cfg_t jbuf_cfg = {
+        .slot_size = UVC_FRAME_BUF_SIZE,
+        .has_len = true,
+    };
+    s_usb_cam.frame.jbuf = frame_buf_create(&jbuf_cfg);
+    if (s_usb_cam.frame.jbuf == NULL) {
+        ESP_LOGE(TAG, "jbuf frame_buf_create failed");
+        return ESP_ERR_NO_MEM;
+    }
+
     /* 事件组必须先创建:uvc_host_install 后设备可能立即触发事件回调(回调里要置位) */
     s_evt = xEventGroupCreate();
     if (s_evt == NULL) {
@@ -359,13 +411,17 @@ esp_err_t usb_camera_init(void)
      *
      * ⚠️ xCoreID = 0 把驱动任务绑在 core 0 —— frame_callback 就跑在这个任务里,
      *    所以这条链路的安全余量 = (URB 数 - 1) × 单个 URB 的填满时长:
-     *        URB 填满时长 = urb_size / 码率 = 10KB / 2.1MB/s ≈ 4.8ms
-     *        3 个 URB,回调期间还有 2 个在排队  →  余量 ≈ 9.6ms
-     *    回调里那次 memcpy(~1ms)相对它很安全。等时传输的 URB 是**按时钟调度**
-     *    填的(不是"数据攒够 10KB 才满"),所以这个时长跟 urb_size/码率成正比。
+     *        URB 实际 12288 B —— 配置里写的 urb_size = 10KiB 只是提示,驱动按
+     *          ISOC 包大小(3072 MPS)向上取整成 4 个包(实测日志
+     *          "Each: 12288 bytes, 4 ISOC packets, 3072 MPS")
+     *        码率上界 ≈ 15.6fps × 68KiB(单帧实测上限) ≈ 1.06MB/s
+     *        → 单个 URB 填满 ≈ 11.6ms;3 个 URB 里还有 2 个在排队 → 余量 ≈ 23ms
+     *    回调里那次 memcpy(实测 0.2~0.5ms)相对它很安全。等时传输的 URB 是
+     *    **按时钟调度**填的(不是"数据攒够一个 URB 才满"),所以这个时长跟
+     *    URB 大小 / 码率成正比。
      *
      *    **如果以后出现"长时间连续不阻塞"的高优先级任务**,它会在核心上把这个
-     *    任务饿死、吃光这 9.6ms。首选做法是把它绑到 core 1
+     *    任务饿死、吃光这 23ms。首选做法是把它绑到 core 1
      *    (xTaskCreatePinnedToCore(..., 1)),而不是加 URB —— 零成本且根治;
      *    加 URB 只是多买缓冲时间,还占 DMA 可用的内部 RAM。 */
     const uvc_host_driver_config_t uvc_config = {

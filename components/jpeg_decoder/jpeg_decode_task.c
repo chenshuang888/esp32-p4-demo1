@@ -1,4 +1,3 @@
-#include <string.h>
 #include <stdlib.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -22,7 +21,6 @@
 struct jpeg_decode_s {
     frame_buf_t *in;           /* 输入 JPEG 帧缓冲：帧源侧（USB 相机 / SD 相册）创建并注入 */
     frame_buf_t *fb;           /* RGB565 输出缓冲：app 上屏 */
-    frame_buf_t *jbuf;         /* JPEG 原数据输出缓冲：SD 卡等存储侧 */
     TaskHandle_t task;
     volatile bool stop;        /* 销毁请求：任务循环检查，退出前释放解码引擎 */
     uint32_t decode_count;
@@ -41,25 +39,15 @@ jpeg_decode_t *jpeg_decode_create(frame_buf_t *in)
     }
     jd->in = in;
 
-    /* RGB565 输出缓冲：上屏消费，无需记录长度 */
+    /* RGB565 输出缓冲：上屏消费，无需记录长度。
+     * 本组件只有一个输出 —— 拍照要用的 JPEG 原数据由帧源侧（usb_camera）自己扇出，
+     * 不从解码器这里取（见 usb_camera_get_jbuf 的说明）。 */
     const frame_buf_cfg_t fb_cfg = {
         .slot_size = JPEG_DEC_FRAME_BUF_SIZE,
         .has_len = false,
     };
     jd->fb = frame_buf_create(&fb_cfg);
     if (jd->fb == NULL) {
-        free(jd);
-        return NULL;
-    }
-
-    /* JPEG 原数据输出缓冲：SD 卡消费需知道实际长度 */
-    const frame_buf_cfg_t jbuf_cfg = {
-        .slot_size = JPEG_BUF_SLOT_SIZE,
-        .has_len = true,
-    };
-    jd->jbuf = frame_buf_create(&jbuf_cfg);
-    if (jd->jbuf == NULL) {
-        frame_buf_delete(jd->fb);
         free(jd);
         return NULL;
     }
@@ -89,8 +77,6 @@ void jpeg_decode_destroy(jpeg_decode_t *jd)
     /* in 由帧源侧创建，这里只释放解码器自建的输出缓冲 */
     frame_buf_delete(jd->fb);
     jd->fb = NULL;
-    frame_buf_delete(jd->jbuf);
-    jd->jbuf = NULL;
     free(jd);
 }
 
@@ -159,22 +145,13 @@ static void jpeg_decode_task(void *arg)
                      esp_err_to_name(err), (unsigned)in_len, soi, eoi,
                      (unsigned)soi_cnt, (int)last_eoi_off, (unsigned)(in_len - 2));
         } else {
-            /* 发布 JPEG 原数据给存储侧（SD 卡）消费者。仅成功解码的帧发布 */
-            if (in_len <= JPEG_BUF_SLOT_SIZE) {
-                uint8_t *jslot = frame_buf_get_write(jd->jbuf);
-                memcpy(jslot, in_data, in_len);
-                frame_buf_commit(jd->jbuf, in_len);
-            } else {
-                ESP_LOGW(TAG, "frame %u exceeds jpeg slot %u, dropped",
-                         (unsigned)in_len, (unsigned)JPEG_BUF_SLOT_SIZE);
-            }
             jd->last_out_size = out_size;
             frame_buf_commit(jd->fb, out_size);
             jd->decode_count++;
         }
 
-        /* 诊断与 JPEG 发布均已从读槽取完数据，才释放读槽；
-         * 若提前 read_done，生产者可立即 commit 覆盖该槽，此处 memcpy 会读到脏数据 */
+        /* 坏帧诊断要扫 in_data，所以 read_done 必须在它之后：
+         * 若提前 read_done，生产者可立即 commit 覆盖该槽，诊断会读到脏数据 */
         frame_buf_read_done(jd->in);
 
         uint32_t now = xTaskGetTickCount();
@@ -211,9 +188,4 @@ esp_err_t jpeg_decode_start(jpeg_decode_t *jd)
 frame_buf_t *jpeg_decode_get_fb(jpeg_decode_t *jd)
 {
     return jd->fb;
-}
-
-frame_buf_t *jpeg_decode_get_jbuf(jpeg_decode_t *jd)
-{
-    return jd->jbuf;
 }

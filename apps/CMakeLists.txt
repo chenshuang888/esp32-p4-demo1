@@ -22,5 +22,4 @@ idf_component_register(
         jpeg_decoder
         frame_buf
         sd_card
-        sd_card_save
 )

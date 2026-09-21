@@ -37,6 +37,7 @@ esp_lcd_ek79007、esp_lcd_touch_gt911、usb_host_uvc 等），不需要手动准
 ```
 main/main.c          唯一入口：只做"编排"（硬件 → 能力 → 注册 App → UI → 进主页）
 apps/                内容层：每个 App 一个 .c，共用一个组件
+                     （拍照保存原本是独立组件，现住在 apps/camera.c 里）
 components/
   app_manager/       框架：App 注册表 + 启动/回主页，零 LVGL 依赖
   ui/                UI 层：把 LVGL 接到屏幕；ui_status_bar 是全局公共状态栏
@@ -45,10 +46,9 @@ components/
   kv_store/          能力：键值存储（NVS 后端）
   time_service/      能力：时间（对时 + 时区，不认识任何时间源）
   sd_card/           能力：SD 卡挂载（之后用 POSIX 文件 API）
-  sd_card_save/      能力：拍照保存（独立任务 + 信号量 + 结果队列）
   frame_buf/         能力：双缓冲原语（丢旧保新 + 读槽占用保护）
   jpeg_decoder/      能力：JPEG → RGB565，上游可以是相机也可以是 SD 相册
-  usb_camera/        能力：UVC 流 → 拼接成完整 JPEG 帧
+  usb_camera/        能力：UVC 流 → 拼接成完整 JPEG 帧，并扇出一份给拍照
 ```
 
 依赖方向单向：`main` → { `apps`, `ui` } → `lcd_screen`；能力组件之间不互相认识，
@@ -66,6 +66,10 @@ components/
   —— 该回调可能正跑在本 screen 内某个对象的事件上。
 - **`enter` 里申请的、游离于 screen 之外的资源，`leave` 里一个都不能漏**
   （LVGL 定时器挂在全局链表上，删 screen 不会带走它）。见 `apps/clock.c`。
+- **谁常驻、谁动态**：进 App 才需要的重资源（相机 App 的解码器：约 1.4MB PSRAM +
+  一条任务）在 `enter` 建、`leave` 拆；反过来，**有不可中断临界区**的东西必须常驻
+  （拍照保存任务写盘期间持着 jbuf 读槽，中途被杀会让读槽永远释放不了）。
+  完整说明见 `apps/camera.c` 顶部。
 - 状态栏的标题/返回按钮由 `components/ui/ui_status_bar.h` 统一提供：
   App 在 `enter` 里 `ui_status_bar_apply()` 填标题，内容从 `UI_STATUS_BAR_HEIGHT`
   往下排，**自己不要画标题和返回按钮**。
@@ -107,7 +111,7 @@ components/
 | frame_buf 必须"先还读槽再等新帧"，反了会死锁（症状：进去显示一帧就冻住） | `apps/camera.c` 的 `on_refresh` |
 | PSRAM 对齐不能写死 64：L2 cache line 是 128B，不对齐解码器直接报错 | `components/frame_buf/frame_buf.c` |
 | JPEG 输出缓冲尺寸/对齐由 IDF 校验，改分辨率要连着改三处 | `components/jpeg_decoder/include/jpeg_decode_task.h` |
-| 拍照文件名必须扫目录取最大编号 +1，静态递增序号重启会覆盖旧照片 | `components/sd_card_save/sd_card_save.c` |
+| 拍照文件名必须扫目录取最大编号 +1，静态递增序号重启会覆盖旧照片 | `apps/camera.c` 的 `sd_next_photo_path` |
 | 相册解码：上一次的读槽要"下次解码前"才还，早了会画到已释放内存 | `apps/photo.c` 的 `photo_show` |
 | USB Host 两项配置是 UVC 能枚举的前提（不是调优项） | `sdkconfig.defaults` |
 | SD 卡那条 LDO "voltage 0 out of range" 警告可忽略且无法消除 | `components/sd_card/sd_card.c` |

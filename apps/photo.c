@@ -41,7 +41,9 @@ static const char *TAG = "photo";
 
 #define PHOTO_MAX         64      /* 一次最多列出多少张；先不做分页，超出的直接不列 */
 #define PHOTO_NAME_MAX    64
-#define PHOTO_SLOT_SIZE   JPEG_BUF_SLOT_SIZE   /* 单张 JPEG 最大字节数，和拍照侧同一个来源 */
+/* 单张 JPEG 的最大字节数：相机拍出来实测 20~80KB，120KB 覆盖波动尖峰与质量档上调。
+ * 这是相册**输入**槽的尺寸，和拍照侧 jbuf 的槽大小是两个独立的量，各自定义。 */
+#define PHOTO_SLOT_SIZE   80000
 #define DECODE_TIMEOUT_MS 200     /* 解码典型 5ms；超时说明这帧解不出来（不是 JPEG / 太大） */
 
 /* ---- 界面：enter 建、leave 清 ---- */
