@@ -24,8 +24,8 @@
  * 保留下来的是那套**持帧时序**（见 on_refresh）和"保存中冻结预览"的做法。
  *
  * 没插摄像头时会是什么样：frame_buf 的读槽从没被写过，初值指向它 -> **一片黑**。
- * 这是刻意从简（App 是验证台，不是产品）；排查时看日志有没有
- * "jpeg_decode: Decoded N frames" 就知道链路通不通。
+ * 这是刻意从简（App 是验证台，不是产品）；排查时看 usb_camera 那三行 INFO
+ * （"UVC device connected" → "UVC stream opened" → "stream started"）就知道流起没起来。
  */
 #include "camera.h"
 
