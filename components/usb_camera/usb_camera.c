@@ -17,12 +17,19 @@
 #define USB_CAMERA_TASK_STACK 4096
 #define USB_CAMERA_TASK_PRIO  6
 
-/* UVC 拼帧槽（单帧 MJPEG 的最大字节数）。同一尺寸也用作拷贝目标 frame_buf 的槽。
+/* 单帧 MJPEG 的最大字节数。这一个宏同时喂两处，必须保持一致：
+ *   ① s_stream_config.advanced.frame_size —— 驱动拼帧槽的大小（现由驱动自己分配）
+ *   ② 我们自己 frame_buf 的槽大小，以及 frame_callback 里的超长检查
  *
  * ⚠️ 这个值必须**实测**，不能照描述符的 dwMaxVideoFrameSize 来定：本机那个值是
  *    614989，而它在相机的出厂默认格式(1280x720@25)和我们请求的格式(640x480@30)
  *    下报的是**同一个数** —— 说明它是设备级的保守常量（大概是照最高支持格式算的），
  *    跟我们实际用的 640x480 没有对应关系。照它分配会过度 8.8 倍。
+ *
+ * ⚠️ 反过来也成立：frame_size **不能填 0**。驱动在 frame_size==0 时会回退到
+ *    dwMaxVideoFrameSize(uvc_host.c:856)，也就是上面那个 614989 —— 2 个槽直接变成
+ *    1.2MB。以前用 user_frame_buffers 时驱动有 UVC_CHECK 强制 frame_size>0
+ *    (uvc_host.c:796)，改成让驱动分配之后那条检查会被跳过，填错**不会有任何提示**。
  *
  * 80KB 的依据：40 秒 / 627 帧的极端场景扫描里最大单帧 69704 B（68 KiB），裕量 1.18 倍。
  *    超了会怎样：驱动报 UVC_HOST_FRAME_BUFFER_OVERFLOW 并丢掉那一帧 —— 不损坏、有
@@ -33,10 +40,10 @@
 /* ---- 事件位：表达"刚刚发生了什么"，和"当前状态"分开 ----
  *
  * 为什么不用"标志 + 轮询"等事件：标志会被后续的相反事件改回原值，轮询就会漏掉
- * 中间那次边沿 —— 设备拔掉后快速插回时 device_connected 又会变回 true，于是任务
+ * 中间那次边沿 —— 设备拔掉后快速插回时 s_device_connected 又会变回 true，于是任务
  * 永远退不出占用期（旧流不关、新设备也不处理）。事件位在被取走之前一直保留，不会丢。
  *
- * 注意下面两处 xEventGroupWaitBits 的掩码是**分开**的，原因见 usb_camera_task。 */
+ * 注意下面两处 xEventGroupWaitBits 的掩码是**分开**的，原因见「管理任务」的不变量 1。 */
 #define EVT_CONN     BIT0    /* 设备连上（uvc_driver_event_cb 置） */
 #define EVT_DISCONN  BIT1    /* 设备断开（stream_callback 置） */
 #define EVT_CMD      BIT2    /* 流的开关请求（usb_camera_stream_request 置） */
@@ -58,25 +65,23 @@ static volatile bool s_is_streaming = false;   /* 实际：驱动是否正在推
  * ===================================================================== */
 
 typedef struct {
-    uint8_t     *user_fb[UVC_FRAME_BUF_NUM]; /* uvc 驱动拼帧槽(驱动 user_frame_buffers) */
     frame_buf_t *uvc_fb;                     /* 帧数据落点(生产者=驱动回调,消费者=解码器) */
     frame_buf_t *jbuf;                       /* 同一份 JPEG 的第二份拷贝(消费者=相机 App 的保存任务) */
 } usb_cam_frame_t;
 
-typedef struct {
-    uint8_t dev_addr;
-    uint8_t uvc_stream_index;
-    bool    device_connected;
-    uvc_host_stream_hdl_t uvc_stream;        /* 当前打开的流(开/关流用;帧的归还由驱动自己做) */
-} usb_cam_connect_t;
-
-typedef struct {
-    usb_cam_connect_t connect;
-    usb_cam_frame_t   frame;
-} usb_camera_ctx_t;
-
-/* usb 相机模块全部状态(连接生命周期 + 帧泵拷贝交接) */
-static usb_camera_ctx_t s_usb_cam;
+/* ---- 模块级状态 ----
+ *
+ * "设备在场"是一个**跨任务的状态**（两个驱动回调写 / 管理任务读），它和 EVT_CONN
+ * 那个**事件**不是一回事（见顶部事件位的注释）—— 所以它只能是独立标志，不可能
+ * 收成管理任务的局部变量：事件到了的时候设备可能已经走了，那条配对的 EVT_DISCONN
+ * 边沿必须靠这个标志才认得出来。
+ * 给它 volatile 是与 s_want_stream / s_is_streaming 保持一致（严格说不是必需：
+ * 读点在 xEventGroupWaitBits 之后，事件组操作自带屏障）。
+ *
+ * 流句柄**不在这里** —— open/start/stop/close 全在管理任务里做，用那个任务自己的
+ * 局部变量就够（"当前打开的流"没有第三个使用者，存成全局是纯死状态）。 */
+static volatile bool   s_device_connected = false;
+static usb_cam_frame_t s_frame;
 
 /* =====================================================================
  * 内部函数声明（s_stream_config 前置引用,定义见下方分区）
@@ -85,7 +90,7 @@ static usb_camera_ctx_t s_usb_cam;
 static bool frame_callback(const uvc_host_frame_t *frame, void *user_ctx);
 static void stream_callback(const uvc_host_stream_event_data_t *event, void *user_ctx);
 
-/* ---- 流配置:MJPEG 640x480@30fps,2 个拼帧输出槽由上层指定 ---- */
+/* ---- 流配置:MJPEG 640x480@30fps,2 个拼帧输出槽由驱动分配 ---- */
 static const uvc_host_stream_config_t s_stream_config = {
     .event_cb = stream_callback,
     .frame_cb = frame_callback,
@@ -104,11 +109,14 @@ static const uvc_host_stream_config_t s_stream_config = {
     .advanced = {
         .number_of_frame_buffers = UVC_FRAME_BUF_NUM,
         .frame_size = UVC_FRAME_BUF_SIZE,
-        .frame_heap_caps = 0,            /* 帧缓冲由 user_frame_buffers 提供,驱动不分配 */
+        .frame_heap_caps = MALLOC_CAP_SPIRAM, /* ⚠️ 拼帧槽改由驱动分配,所以必须指明放 PSRAM。
+                                               * 填 0 不是"不限" —— 驱动会当成 MALLOC_CAP_DEFAULT
+                                               * (= 内部 RAM),2×80KB 静默挤占 URB 的 DMA 空间,
+                                               * 不报错、只是启动日志里内存数字难看。 */
         .number_of_urbs = 3,
         .urb_size = 10 * 1024,           /* 只是提示:驱动会向上取整到 ISOC 包的整数倍
                                           * (本机实际 4×3072 = 12288,见 uvc_host_install 那段) */
-        .user_frame_buffers = s_usb_cam.frame.user_fb, /* 上层指定输出槽数量与位置 */
+        /* user_frame_buffers 留空(NULL):槽交给驱动分配并管理,我们不再持有 */
     },
 };
 
@@ -129,14 +137,18 @@ static void usb_lib_task(void *arg)
     }
 }
 
-/* ---- 设备连接事件回调(运行在驱动后台任务,须轻量):记录地址,唤醒管理任务 ---- */
+/* ---- 设备连接事件回调(运行在驱动后台任务,须轻量):置状态,唤醒管理任务 ----
+ *
+ * 地址/流索引**就地打印** —— 信息本来就在 event 里,没必要先存进全局再让管理任务
+ * 取出来打（本文件其它回调也是就地打日志）。这里必然早于管理任务被唤醒，所以
+ * 日志顺序仍是 "device connected" 在前、"stream opened" 在后。 */
 static void uvc_driver_event_cb(const uvc_host_driver_event_data_t *event, void *user_ctx)
 {
     (void)user_ctx;
     if (event->type == UVC_HOST_DRIVER_EVENT_DEVICE_CONNECTED) {
-        s_usb_cam.connect.dev_addr = event->device_connected.dev_addr;
-        s_usb_cam.connect.uvc_stream_index = event->device_connected.uvc_stream_index;
-        s_usb_cam.connect.device_connected = true;
+        ESP_LOGI(TAG, "UVC device connected: dev_addr=%u stream_index=%u",
+                 event->device_connected.dev_addr, event->device_connected.uvc_stream_index);
+        s_device_connected = true;
         xEventGroupSetBits(s_evt, EVT_CONN);
     }
 }
@@ -151,7 +163,7 @@ static void stream_callback(const uvc_host_stream_event_data_t *event, void *use
         break;
     case UVC_HOST_DEVICE_DISCONNECTED:
         ESP_LOGI(TAG, "Device disconnected");
-        s_usb_cam.connect.device_connected = false;   /* 状态：给"设备是否就绪"这类判断用 */
+        s_device_connected = false;                   /* 状态：给"设备是否就绪"这类判断用 */
         xEventGroupSetBits(s_evt, EVT_DISCONN);       /* 事件：唤醒占用期，立刻退出 */
         break;
     case UVC_HOST_FRAME_BUFFER_OVERFLOW:
@@ -166,103 +178,145 @@ static void stream_callback(const uvc_host_stream_event_data_t *event, void *use
     }
 }
 
-/* ---- 管理任务:负责"打开流"和"拆解回收" ----
+/* =====================================================================
+ * 管理任务
  *
- * 这里只留**一个**通知机制(Event Group),不再用标志轮询等事件(原因见顶部事件位的注释)。
+ * 一个 USB 设备的一生，四个阶段，一阶段一个函数：
  *
- * 两个等待点的掩码是**分开**的,这是关键:
- *   - 等连接只等 EVT_CONN    → 占用期里来的 EVT_CONN 不会被顺手清掉
- *   - 占用期只等 DISCONN/CMD → EVT_CONN 留着给下一轮用
- * 若两处用同一个掩码,"断开又快速插入"会让两个位同时挂起、被一起消费,结果处理了
- * 断开却把连接丢了,任务再也等不到下一次连接。
+ *     等连接 ──► 开流 ──► 会话(对齐意愿 / 等断开) ──► 关流 ──┐
+ *        ▲                                                    │
+ *        └───────────────────── 重连 ─────────────────────┘
  *
- * 所有对流句柄的操作(open/start/stop/close)都必须在这个任务里做:驱动只给
- * open/close 加了锁(open_close_mutex),start/stop **没有** —— 跨任务调用会与 close
- * 抢同一个 handle(拔线那一刻就可能 use-after-free)。
- */
+ * 主任务就是这四行；每个阶段的"为什么"写在各自的函数头上。
+ *
+ * ------------------------------ 不变量 ------------------------------
+ * 动这一块的任何代码之前，先把下面四条读一遍：
+ *
+ * 1. 两个等待点的掩码必须**分开**：等连接只等 EVT_CONN；占用期只等 DISCONN|CMD。
+ *    若合成一个掩码，"断开又快速插入"会让两个位同时挂起、被一起消费 —— 结果处理了
+ *    断开却把连接丢了，任务再也等不到下一次连接。
+ *
+ * 2. **流句柄只在管理任务里操作**（open/start/stop/close）。驱动只给 open/close 加了
+ *    锁(open_close_mutex)，start/stop **没有** —— 跨任务调用会和 close 抢同一个
+ *    handle（拔线那一刻就可能 use-after-free）。
+ *
+ * 3. **"想不想看"和"正在推不推"必须分开记**（s_want_stream / s_is_streaming）：
+ *    "设备没插、人已经在相机 App 里等着"是常态，一个变量表达不了这两个维度。
+ *
+ * 4. **"事件"和"状态"不是一回事**：EVT_* 是"刚发生了什么"（取走就没了），
+ *    s_device_connected 是"此刻在不在"（一直可读）。区别见文件顶部"事件位"那段。
+ * ===================================================================== */
+
+static bool                  wait_for_connection(void);
+static uvc_host_stream_hdl_t open_stream(void);
+static void                  run_session(uvc_host_stream_hdl_t stream);
+static void                  close_stream(uvc_host_stream_hdl_t stream);
+
 static void usb_camera_task(void *arg)
 {
     (void)arg;
 
-    while (1) {
-        /* ============ 1. 等设备连上 ============ */
-        xEventGroupWaitBits(s_evt, EVT_CONN, pdTRUE, pdFALSE, portMAX_DELAY);
-
-        /* 连接事件到了、但设备其实已经走了(连上后马上又拔):顺手消费掉配对的断开边沿。
-         * 不清的话它会留到下一轮,把新一轮刚开的流立刻关掉。 */
-        if (!s_usb_cam.connect.device_connected) {
-            xEventGroupClearBits(s_evt, EVT_DISCONN);
-            continue;
+    for (;;) {
+        if (!wait_for_connection()) {
+            continue;                   /* 这次连接事件已经作废，重来 */
         }
-
-        ESP_LOGI(TAG, "UVC device connected: dev_addr=%u stream_index=%u",
-                 s_usb_cam.connect.dev_addr, s_usb_cam.connect.uvc_stream_index);
-
-        /* ============ 2. 打开流(必须早做,与 App 无关) ============
-         * 注意**只 open 不 start**:推流由 App 的 enter 按需触发(见下面占用期)。
-         *
-         * 为什么 open 不能也推迟到 enter 里？**不是**因为耗时 —— 实测只要 16ms
-         * (uvc_host_stream_open 那个 5000ms 是"等设备出现"的**超时上限**,
-         *  设备已枚举时第一轮就返回)。真正的原因是:
-         *   **UVC 的"设备断开"事件是流级的** —— 驱动级只有 DEVICE_CONNECTED,
-         *   DEV_GONE 只对 uvc_stream_list 里的流发事件。没有流就收不到断开通知,
-         *   device_connected 会说谎,管理任务也就不知道该 close/reopen。
-         * 本机实测时序: initialized(1616) → device connected(2094) → opened(2110)。 */
-        uvc_host_stream_hdl_t stream = NULL;
-        esp_err_t err = uvc_host_stream_open(&s_stream_config, pdMS_TO_TICKS(5000), &stream);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "uvc_host_stream_open failed: %s", esp_err_to_name(err));
-            xEventGroupClearBits(s_evt, EVT_DISCONN);   /* 同上:清掉开流期间的断开边沿 */
-            continue;
+        uvc_host_stream_hdl_t stream = open_stream();
+        if (stream == NULL) {
+            continue;                   /* 开流失败，重来 */
         }
-        s_usb_cam.connect.uvc_stream = stream;
-        s_is_streaming = false;
-        ESP_LOGI(TAG, "UVC stream opened (idle, not streaming)");
-
-        /* ============ 3. 占用期 ============ */
-        for (;;) {
-            /* 把"期望"落到"实际" —— enter/leave 那两行最终在这里生效。
-             * 放在等待**之前**,所以"设备刚插上、人已经在 App 里等着"这种组合能立刻开流。 */
-            if (s_want_stream && !s_is_streaming) {
-                err = uvc_host_stream_start(stream);
-                if (err == ESP_OK) {
-                    s_is_streaming = true;
-                    ESP_LOGI(TAG, "stream started");
-                } else {
-                    /* 故意不重试:start 里含控制传输,失败后死循环重试会白烧总线 + 刷屏。
-                     * 下次 enter/leave 会带来新的 EVT_CMD,那时再试。 */
-                    ESP_LOGE(TAG, "uvc_host_stream_start failed: %s", esp_err_to_name(err));
-                }
-            } else if (!s_want_stream && s_is_streaming) {
-                err = uvc_host_stream_stop(stream);
-                s_is_streaming = false;
-                if (err == ESP_OK) {
-                    ESP_LOGI(TAG, "stream stopped");
-                } else {
-                    ESP_LOGE(TAG, "uvc_host_stream_stop failed: %s", esp_err_to_name(err));
-                }
-            }
-
-            /* 只在"断开"或"新的开关请求"时醒来 —— 没有轮询。
-             * 退出条件只有断开事件:不再用 device_connected 当循环条件,那个标志会被
-             * "快速插回"改回 true,导致永远出不来(旧流不关、新设备不处理)。 */
-            EventBits_t bits = xEventGroupWaitBits(s_evt, EVT_DISCONN | EVT_CMD,
-                                                   pdTRUE, pdFALSE, portMAX_DELAY);
-            if (bits & EVT_DISCONN) {
-                ESP_LOGI(TAG, "Device disconnected");
-                break;
-            }
-        }
-
-        /* ============ 4. 拆解回收 ============
-         * 断开时驱动自己已经把流 pause 了(uvc_host.c 的 DEV_GONE 分支),这里要做的是
-         * "拆":释放 3 个 URB、释放接口、归还 USB 设备引用、free 掉 stream 结构体。
-         * 不做的话每次拔插漏一份,而且漏的是内部 RAM + DMA 能力。 */
-        s_is_streaming = false;      /* 驱动已 pause,同步我们的记录 */
-        uvc_host_stream_close(stream);
-        s_usb_cam.connect.uvc_stream = NULL;
-        ESP_LOGI(TAG, "Stream closed, waiting for reconnect");
+        run_session(stream);            /* 只在设备断开时返回 */
+        close_stream(stream);
     }
+}
+
+/* ---- 阶段 1：等下一次连接，并回答"设备真的还在吗" ----
+ *
+ * 这里同时是**唯一**清 EVT_DISCONN 的地方：本轮还没开流，就不会有占用期去消费那条
+ * 配对边沿，只能在这里清。不清的话它会留到下一轮，把新一轮刚开的流立刻关掉。
+ *
+ * 返回 false = 连接事件到了、但设备其实已经走了（连上后马上又拔）—— 这靠
+ * s_device_connected 这个"状态"才认得出来（见不变量 4）。 */
+static bool wait_for_connection(void)
+{
+    xEventGroupWaitBits(s_evt, EVT_CONN, pdTRUE, pdFALSE, portMAX_DELAY);
+    xEventGroupClearBits(s_evt, EVT_DISCONN);
+    return s_device_connected;
+}
+
+/* ---- 阶段 2：打开流（只 open、不 start），失败返回 NULL ----
+ *
+ * 只 open 不 start：推流由会话期按 App 的意愿开关，这里不管。
+ *
+ * ⚠️ 为什么 open 要在这里做、而不是等 App 进了相机再做？**不是因为耗时** —— 实测
+ *    只要 16ms（那个 5000ms 是"等设备出现"的**超时上限**，设备已枚举时第一轮就返回；
+ *    本机时序 initialized(1616) → device connected(2094) → opened(2110)）。
+ *    真正的原因是：**UVC 的"设备断开"事件是流级的** —— 驱动级只有 DEVICE_CONNECTED，
+ *    DEV_GONE 只发给 uvc_stream_list 里的流。**没有流就收不到断开通知**，管理任务
+ *    也就不知道该 close/reopen。所以只要设备在，就让它一直挂着一条流 ——
+ *    代价只是 open 本身，不推流、不占带宽。 */
+static uvc_host_stream_hdl_t open_stream(void)
+{
+    uvc_host_stream_hdl_t stream = NULL;
+    esp_err_t err = uvc_host_stream_open(&s_stream_config, pdMS_TO_TICKS(5000), &stream);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "uvc_host_stream_open failed: %s", esp_err_to_name(err));
+        return NULL;
+    }
+    s_is_streaming = false;
+    ESP_LOGI(TAG, "UVC stream opened (idle, not streaming)");
+    return stream;
+}
+
+/* ---- 阶段 3：会话期 —— 把"意愿"落到"实际"，直到设备断开 ----
+ *
+ * 三条规矩：
+ *  ① 对齐必须在**等待之前**做 —— 所以"设备刚插上、人已经在 App 里等着"能立刻开流，
+ *     不用多等一轮。
+ *  ② 退出只认 EVT_DISCONN。**不能**拿状态（比如"设备在不在"）当循环条件：那个标志
+ *     会被"快速插回"改回 true，任务就永远退不出占用期（旧流不关、新设备也不处理）。
+ *  ③ start 失败**故意不重试**：start 里含控制传输，失败后死循环重试会白烧总线 +
+ *     刷屏。下一次 enter/leave 会带来新的 EVT_CMD，那时再试。 */
+static void run_session(uvc_host_stream_hdl_t stream)
+{
+    for (;;) {
+        if (s_want_stream && !s_is_streaming) {
+            esp_err_t err = uvc_host_stream_start(stream);
+            if (err == ESP_OK) {
+                s_is_streaming = true;
+                ESP_LOGI(TAG, "stream started");
+            } else {
+                ESP_LOGE(TAG, "uvc_host_stream_start failed: %s", esp_err_to_name(err));
+            }
+        } else if (!s_want_stream && s_is_streaming) {
+            esp_err_t err = uvc_host_stream_stop(stream);
+            s_is_streaming = false;
+            if (err == ESP_OK) {
+                ESP_LOGI(TAG, "stream stopped");
+            } else {
+                ESP_LOGE(TAG, "uvc_host_stream_stop failed: %s", esp_err_to_name(err));
+            }
+        }
+
+        /* 只等"断开"或"新的开关请求" —— 没有轮询（掩码为什么不能合并，见不变量 1）。 */
+        EventBits_t bits = xEventGroupWaitBits(s_evt, EVT_DISCONN | EVT_CMD,
+                                               pdTRUE, pdFALSE, portMAX_DELAY);
+        if (bits & EVT_DISCONN) {
+            ESP_LOGI(TAG, "Device disconnected");
+            break;
+        }
+    }
+}
+
+/* ---- 阶段 4：回收这一轮的流 ----
+ *
+ * 断开时驱动自己已经把流 pause 了（uvc_host.c 的 DEV_GONE 分支），这里要做的是"拆"：
+ * 释放 3 个 URB、释放接口、归还 USB 设备引用、free 掉 stream 结构体。**不做的话每次
+ * 拔插漏一份，而且漏的是内部 RAM + DMA 能力。** */
+static void close_stream(uvc_host_stream_hdl_t stream)
+{
+    s_is_streaming = false;      /* 驱动已 pause，同步我们的记录 */
+    uvc_host_stream_close(stream);
+    ESP_LOGI(TAG, "Stream closed, waiting for reconnect");
 }
 
 /* ---- 按需开关推流:由相机 App 的 enter/leave 调用 ----
@@ -316,14 +370,14 @@ static bool frame_callback(const uvc_host_frame_t *frame, void *user_ctx)
     }
 
     /* ① 给解码器 */
-    uint8_t *slot = frame_buf_get_write(s_usb_cam.frame.uvc_fb);
+    uint8_t *slot = frame_buf_get_write(s_frame.uvc_fb);
     memcpy(slot, frame->data, frame->data_len);
-    frame_buf_commit(s_usb_cam.frame.uvc_fb, frame->data_len);
+    frame_buf_commit(s_frame.uvc_fb, frame->data_len);
 
     /* ② 给 相机 App 的保存任务(拍照)。消费者忙(正在写盘)时 commit 返回 false 自动丢本帧 */
-    uint8_t *jslot = frame_buf_get_write(s_usb_cam.frame.jbuf);
+    uint8_t *jslot = frame_buf_get_write(s_frame.jbuf);
     memcpy(jslot, frame->data, frame->data_len);
-    frame_buf_commit(s_usb_cam.frame.jbuf, frame->data_len);
+    frame_buf_commit(s_frame.jbuf, frame->data_len);
 
     return true;    /* 处理完了,所有权立刻还给驱动 */
 }
@@ -336,12 +390,12 @@ static bool frame_callback(const uvc_host_frame_t *frame, void *user_ctx)
 
 frame_buf_t *usb_camera_get_fb(void)
 {
-    return s_usb_cam.frame.uvc_fb;
+    return s_frame.uvc_fb;
 }
 
 frame_buf_t *usb_camera_get_jbuf(void)
 {
-    return s_usb_cam.frame.jbuf;
+    return s_frame.jbuf;
 }
 
 /* =====================================================================
@@ -350,24 +404,15 @@ frame_buf_t *usb_camera_get_jbuf(void)
 
 esp_err_t usb_camera_init(void)
 {
-    memset(&s_usb_cam, 0, sizeof(s_usb_cam));
-
-    /* 帧源原语必须就绪于设备接入之前:uvc 拼帧槽 + frame_buf 落点 */
-    for (int i = 0; i < UVC_FRAME_BUF_NUM; i++) {
-        s_usb_cam.frame.user_fb[i] = heap_caps_aligned_alloc(64, UVC_FRAME_BUF_SIZE, MALLOC_CAP_SPIRAM);
-        if (s_usb_cam.frame.user_fb[i] == NULL) {
-            ESP_LOGE(TAG, "frame buf %d alloc failed", i);
-            return ESP_ERR_NO_MEM;
-        }
-    }
-
-    /* 帧数据落点:驱动回调直接 memcpy 进这里的槽,解码器从这消费 */
+    /* 帧数据落点:驱动回调直接 memcpy 进这里的槽,解码器从这消费。
+     * (uvc 那边用来拼帧的 2 个槽**不在这里**分配 —— 交给驱动自己管,
+     *  见 s_stream_config 的 frame_heap_caps) */
     const frame_buf_cfg_t fb_cfg = {
         .slot_size = UVC_FRAME_BUF_SIZE,
         .has_len = true,
     };
-    s_usb_cam.frame.uvc_fb = frame_buf_create(&fb_cfg);
-    if (s_usb_cam.frame.uvc_fb == NULL) {
+    s_frame.uvc_fb = frame_buf_create(&fb_cfg);
+    if (s_frame.uvc_fb == NULL) {
         ESP_LOGE(TAG, "frame_buf_create failed");
         return ESP_ERR_NO_MEM;
     }
@@ -379,8 +424,8 @@ esp_err_t usb_camera_init(void)
         .slot_size = UVC_FRAME_BUF_SIZE,
         .has_len = true,
     };
-    s_usb_cam.frame.jbuf = frame_buf_create(&jbuf_cfg);
-    if (s_usb_cam.frame.jbuf == NULL) {
+    s_frame.jbuf = frame_buf_create(&jbuf_cfg);
+    if (s_frame.jbuf == NULL) {
         ESP_LOGE(TAG, "jbuf frame_buf_create failed");
         return ESP_ERR_NO_MEM;
     }
@@ -430,7 +475,7 @@ esp_err_t usb_camera_init(void)
         .xCoreID = 0,
         .create_background_task = true,
         .event_cb = uvc_driver_event_cb,
-        .user_ctx = &s_usb_cam,
+        .user_ctx = NULL,       /* 回调不需要上下文:设备相关的状态都在本文件的 static 里 */
     };
     err = uvc_host_install(&uvc_config);
     if (err != ESP_OK) {
