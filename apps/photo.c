@@ -7,16 +7,19 @@
  *    也没有"未插卡"之类的引导（列不出来就是空列表 + 一行提示）。
  *
  * 真正的活都在两个现成接口上，本 App 只是把它们接起来：
- *   POSIX       读文件（sd_card 组件挂上 FATFS 之后直接 fopen）
- *   jpeg_decoder 解码（它本来就是按"上游可以是 USB 相机，也可以是 SD 相册"设计的）
+ *   POSIX        读文件（sd_card 组件挂上 FATFS 之后直接 fopen）
+ *   jpeg_decoder 解码（同步一次性接口，不关心帧从哪来）
  *
- * 解码链路是这样接的：本 App 自己建一个输入 frame_buf，把文件字节读进去 commit，
- * 解码器任务解完把 RGB565 写进它的输出 frame_buf，这里取读槽直接交给 lv_image ——
- * 中间不多一份拷贝。
+ * 解码链路：把文件字节读进**一块普通 PSRAM 缓冲**，直接调 jpeg_decode_frame()
+ * 同步解到解码器自己的画布上，然后把那块画布交给 lv_image —— 中间不多一份拷贝。
  *
- * 生命周期：解码器（含一条任务、约 1.7MB PSRAM）在 enter 建、leave 销毁。
- * 换来的是不进相册时不占这些资源；相机 App 那条解码器是常驻的，两者互不干扰
- * （各自有独立的输入 frame_buf 和引擎）。
+ * 输入为什么不需要 frame_buf：那个类型的价值在于"生产者和消费者会并发"，而这里
+ * 读写都在 LVGL 任务里、一读一解就结束了。IDF 也明确说输入缓冲**没有对齐要求**
+ * （只有输出有，见 jpeg_decoder.c 里的说明），所以普通 heap_caps_malloc 就够 ——
+ * 顺带从两个槽 160KB 降到一块 80KB。
+ *
+ * 生命周期：解码引擎 + 600KB 画布，在 enter 建、leave 销毁。没有任务，
+ * 所以销毁是平凡的（不再有"等解码任务退出"那一百毫秒）。
  */
 #include "photo.h"
 
@@ -27,12 +30,12 @@
 #include <strings.h>
 
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "esp_lvgl_port.h"
 #include "lvgl.h"
 
 #include "app_manager.h"
-#include "frame_buf.h"
-#include "jpeg_decode_task.h"
+#include "jpeg_decoder.h"
 #include "picture.h"
 #include "sd_card.h"
 #include "ui_status_bar.h"
@@ -42,9 +45,8 @@ static const char *TAG = "photo";
 #define PHOTO_MAX         64      /* 一次最多列出多少张；先不做分页，超出的直接不列 */
 #define PHOTO_NAME_MAX    64
 /* 单张 JPEG 的最大字节数：相机拍出来实测 20~80KB，120KB 覆盖波动尖峰与质量档上调。
- * 这是相册**输入**槽的尺寸，和拍照侧 jbuf 的槽大小是两个独立的量，各自定义。 */
+ * 这是相册**输入缓冲**的尺寸，和拍照侧 jbuf 的槽大小是两个独立的量，各自定义。 */
 #define PHOTO_SLOT_SIZE   80000
-#define DECODE_TIMEOUT_MS 200     /* 解码典型 5ms；超时说明这帧解不出来（不是 JPEG / 太大） */
 
 /* ---- 界面：enter 建、leave 清 ---- */
 static lv_obj_t *s_scr    = NULL;
@@ -54,11 +56,9 @@ static lv_obj_t *s_image  = NULL;
 static lv_obj_t *s_status = NULL;   /* 底部一行：张数 / 文件名 / 出错原因 */
 
 /* ---- 解码链路：enter 建、leave 销毁 ---- */
-static frame_buf_t   *s_in  = NULL;     /* 本 App 建，喂给解码器的 JPEG 输入槽 */
-static frame_buf_t   *s_out = NULL;     /* 解码器的 RGB565 输出槽（借来的，不用释放） */
-static jpeg_decode_t *s_jd  = NULL;
-static lv_image_dsc_t s_dsc;
-static bool           s_frame_held = false;
+static uint8_t        *s_in  = NULL;    /* 本 App 建：读文件用的 JPEG 输入缓冲（普通 PSRAM） */
+static jpeg_decoder_t *s_jd  = NULL;    /* 解码器（引擎 + 它自己那块输出画布） */
+static lv_image_dsc_t  s_dsc;
 
 /* 扫描结果。文件名整份留在这里，点击时按下标去取 —— 行对象的 user_data 只存下标 */
 static char s_names[PHOTO_MAX][PHOTO_NAME_MAX];
@@ -116,10 +116,9 @@ static void photo_show_list_status(void)
 /*
  * 回到列表页。
  *
- * ⚠️ 这里刻意**不**释放解码输出的读槽：屏幕上那张图还指着它的内存，
- *    现在还回去，解码器下一次 commit 就会往这块内存里写新数据。
- *    改成"下次真要解码之前才还"（见 photo_show 里的第 ① 步）—— 和相机 App
- *    的持帧纪律一致，也保证任何时刻"屏幕上那一帧"都是被占住的。
+ * 只切两个容器的显示/隐藏 —— 屏幕上那张图仍然指着解码器的画布，但画布归解码器
+ * 所有、且这一轮不会再被写（只有 photo_show 里解码才会写它），所以这里不需要
+ * 做任何"还槽"的动作。
  */
 static void photo_show_list(void)
 {
@@ -158,8 +157,7 @@ static void photo_show(int idx)
         lv_label_set_text(s_status, "File size out of range");
         return;
     }
-    uint8_t *slot = frame_buf_get_write(s_in);
-    const size_t n = fread(slot, 1, (size_t)size, f);
+    const size_t n = fread(s_in, 1, (size_t)size, f);
     fclose(f);
     if (n != (size_t)size) {
         ESP_LOGE(TAG, "%s short read: %u/%ld", path, (unsigned)n, size);
@@ -167,28 +165,17 @@ static void photo_show(int idx)
         return;
     }
 
-    /* ① 先还上一帧的读槽：不还的话解码器发布不了新结果（commit 失败），下面必然超时。
-     *    还在这里是安全的 —— 屏幕上那张图马上就被新图替换掉，
-     *    而 LVGL 的重绘在我们返回之后才发生，中间不会有人去画已释放的那块内存。 */
-    if (s_frame_held) {
-        frame_buf_read_done(s_out);
-        s_frame_held = false;
-    }
-
-    /* ② 把文件字节交给解码器，然后等它出结果。
-     *    commit 返回 false = 解码器还占着输入读槽（上一帧没消化完），本帧被丢了。 */
-    if (!frame_buf_commit(s_in, (uint32_t)n)) {
-        lv_label_set_text(s_status, "Decoder busy");
-        return;
-    }
-    if (!frame_buf_wait_new(s_out, DECODE_TIMEOUT_MS)) {
+    /* 同步解码。⚠️ 这一下会挡住 LVGL 任务约 4.9ms（坏帧会走到引擎 15ms 的上限）——
+     *    已知并接受，契约见 jpeg_decoder.h。
+     *    失败时不改写 out，屏幕上前一张图原样留着，所以这里不用管。 */
+    uint8_t *out = NULL;
+    if (jpeg_decode_frame(s_jd, s_in, n, &out) != ESP_OK) {
         lv_label_set_text(s_status, "Decode failed");
         return;
     }
 
-    /* ③ 取读槽上屏。注意拿到的是解码器输出缓冲里的**那一块**地址，不是拷贝 */
-    s_dsc.data = frame_buf_get_read(s_out, NULL);
-    s_frame_held = true;
+    /* 上屏：拿到的是解码器画布里的**那一块**地址，不是拷贝 */
+    s_dsc.data = out;
     lv_image_set_src(s_image, &s_dsc);
 
     lv_obj_remove_flag(s_imgbox, LV_OBJ_FLAG_HIDDEN);
@@ -250,22 +237,22 @@ static void photo_enter(void)
     s_status = lv_label_create(body);
     lv_label_set_text(s_status, "");
 
-    /* ---- 解码链路：本 App 建输入槽 -> 解码器 -> 它的输出槽 ---- */
-    const frame_buf_cfg_t in_cfg = {
-        .slot_size = PHOTO_SLOT_SIZE,
-        .has_len   = true,          /* 解码器要知道这一帧 JPEG 有多少字节 */
-    };
-    s_in = frame_buf_create(&in_cfg);
-    if (s_in != NULL) {
-        s_jd = jpeg_decode_create(s_in);
-    }
-    if (s_jd != NULL && jpeg_decode_start(s_jd) != ESP_OK) {
-        jpeg_decode_destroy(s_jd);
-        s_jd = NULL;
-    }
-    s_out = (s_jd != NULL) ? jpeg_decode_get_fb(s_jd) : NULL;
+    /* ---- 解码链路：本 App 建输入缓冲 -> 解码器（它自己带输出画布）---- */
+    s_in = heap_caps_malloc(PHOTO_SLOT_SIZE, MALLOC_CAP_SPIRAM);
+    s_jd = jpeg_decode_init();
 
-    if (s_out != NULL) {
+    if (s_in == NULL || s_jd == NULL) {
+        ESP_LOGE(TAG, "解码链路没起来，列表能看但点开没反应");
+        /* 半成品也收干净：不留任何资源 */
+        if (s_jd != NULL) {
+            jpeg_decode_deinit(s_jd);
+            s_jd = NULL;
+        }
+        if (s_in != NULL) {
+            heap_caps_free(s_in);
+            s_in = NULL;
+        }
+    } else {
         s_dsc.header.magic  = LV_IMAGE_HEADER_MAGIC;
         s_dsc.header.cf     = LV_COLOR_FORMAT_RGB565;
         s_dsc.header.w      = JPEG_DEC_FRAME_W;
@@ -273,20 +260,15 @@ static void photo_enter(void)
         s_dsc.header.stride = JPEG_DEC_FRAME_W * JPEG_DEC_FRAME_PIXEL;
         s_dsc.data_size     = JPEG_DEC_FRAME_BUF_SIZE;
 
-        /* ⚠️ data 初值必须指向**有效内存**（哪怕内容是黑的），否则 LVGL 绘制空 data
-         *    会崩。做法照抄相机 App：先借一次读槽当初始画面，立刻还回去。 */
-        s_dsc.data = frame_buf_get_read(s_out, NULL);
-        frame_buf_read_done(s_out);
-        s_frame_held = false;
-
+        /* ⚠️ 这里**不**给 s_image 设 src —— 画布要等第一次成功解码才拿得到。
+         *    空 src 的 lv_image 什么都不画、不会崩，所以不再需要以前那套
+         *    "先借一次读槽当初始画面"。尺寸显式设出来，居中就不依赖 src 何时到位。 */
         s_image = lv_image_create(s_imgbox);
-        lv_image_set_src(s_image, &s_dsc);
+        lv_obj_set_size(s_image, JPEG_DEC_FRAME_W, JPEG_DEC_FRAME_H);
         /* 640×480 原样、不缩放，居中放在看图容器里（和相机 App 同一个取舍） */
         lv_obj_center(s_image);
         lv_obj_add_flag(s_image, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_event_cb(s_image, on_image_clicked, LV_EVENT_CLICKED, NULL);
-    } else {
-        ESP_LOGE(TAG, "decoder unavailable, 列表能看但点开没反应");
     }
 
     /* 初始显示列表页 */
@@ -309,22 +291,17 @@ static void photo_leave(void)
     ESP_LOGI(TAG, "leave");
     lvgl_port_lock(0);
 
-    /* ① 先还掉可能还压着的读槽，再拆解码链路 —— 顺序反了的话 frame_buf_delete
-     *    之后 s_out 就是野指针了。 */
-    if (s_frame_held) {
-        frame_buf_read_done(s_out);
-        s_frame_held = false;
-    }
+    /* ① 拆解码链路：引擎 + 600KB 画布一起释放，**没有等待**（同步解码没有任务）。
+     *    安全性来自 app_manager 的顺序（enter(新) → leave(旧)）：走到这里时相册
+     *    这张 screen 已经不在台面上了，不会再有人去画那块画布。
+     *    以前那条"先还读槽再拆"的顺序纪律不需要了 —— 输出不再是 frame_buf。 */
     if (s_jd != NULL) {
-        /* 内部会等解码任务自己退出（它 100ms 一轮轮询），实测约 100ms。
-         * 这一步是在持着 LVGL 锁的情况下等的 —— 退相册会有一瞬间的停顿，
-         * 但换来的是"引擎和两个输出缓冲都真的释放了"。 */
-        jpeg_decode_destroy(s_jd);
+        jpeg_decode_deinit(s_jd);
         s_jd = NULL;
     }
-    s_out = NULL;
-    if (s_in != NULL) {                 /* 输入槽是本 App 建的，由本 App 释放 */
-        frame_buf_delete(s_in);
+    s_dsc.data = NULL;                  /* 画布已经没了，别留野指针 */
+    if (s_in != NULL) {                 /* 输入缓冲是本 App 建的，由本 App 释放 */
+        heap_caps_free(s_in);
         s_in = NULL;
     }
 

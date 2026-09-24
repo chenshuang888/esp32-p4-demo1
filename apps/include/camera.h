@@ -8,12 +8,12 @@
  *
  * 它用到两个组件，外加一块住在自己文件里的东西：
  *   usb_camera    UVC 流 → 拼帧 → frame_buf（MJPEG，并扇出一份给拍照）
- *   jpeg_decoder  frame_buf → 解码 → frame_buf（RGB565）
+ *   jpeg_decoder  从 uvc_fb 取裸 JPEG 字节 → 同步解码 → 自有画布（RGB565）
  *   拍照保存      原本是独立的 sd_card_save 组件，现已并入 camera.c
  *
  * 生命周期分两类（理由见 camera.c 顶部）：
  *   常驻（camera_init）：usb_camera、拍照保存任务
- *   每次进出（enter/leave）：jpeg_decoder 实例、界面
+ *   每次进出（enter/leave）：jpeg_decoder（引擎 + 600KB 画布）、界面
  */
 #pragma once
 
@@ -27,17 +27,19 @@ extern "C" {
  * @brief 常驻部分：把相机链路搭起来（USB Host + UVC 驱动 + 拍照保存任务）
  *
  * 由 main 在注册 App 之前调一次，位置和 time_service_init() 同层。
- * 这里建的两样**都不跟 enter/leave 拆**：帧源必须常驻（UVC 的断开事件是流级的），
- * 保存任务也必须常驻（它写盘期间持着 jbuf 读槽）—— 详见 camera.c 顶部的说明。
+ * 这里建的两样**都不跟 enter/leave 拆**：帧源必须常驻（一条流从 init 起挂到重启，
+ * 见 usb_camera.h），保存任务也必须常驻（它写盘期间持着 jbuf 读槽）
+ * —— 详见 camera.c 顶部的说明。
  *
- * **解码器不在这里建**：它跟着 camera_enter/camera_leave 按需生灭。
- * 所以本函数和界面无关，进出 App 也不会重新 open 流（open 只在设备接入时做一次，
- * 本机实测 16ms）。
+ * **解码器不在这里建**：它跟着 camera_enter/camera_leave 按需生灭（进相机才占
+ * 引擎和那 600KB 画布）。所以本函数和界面无关，进出 App 也不会重新 open 流
+ * （open 只在这里做一次，本机实测 16ms）。
+ * 但本函数会**同步等摄像头就位**，最多 5s —— 没插摄像头就返回错误。
  *
- * 但**推流是单独管的**：设备接入后这里只 open、不 start；推流由 enter/leave 经
- * usb_camera_stream_request() 按需开关。这样"人在别的 App 里"时，摄像头不占 USB
- * 带宽、也不跑解码（解码 4.9ms/帧 × 实测 15.6fps ≈ 7.6% core1）。
- * 详见 usb_camera_stream_request()。
+ * 但**推流是单独管的**：这里只 open、不 start；推流由 enter/leave 经
+ * usb_camera_stream_start/stop() 按需开关（那两个调用是**阻塞**的）。这样"人在别的 App
+ * 里"时，摄像头不占 USB 带宽、也不跑解码（解码 4.9ms/帧 × 实测 15.6fps ≈ 7.6%，
+ * 现在这部分开销落在 LVGL 任务上）。详见 usb_camera_stream_start()。
  *
  * @return ESP_OK 成功；其余为 esp_err_t 错误码
  */

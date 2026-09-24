@@ -4,14 +4,14 @@
  * 本文件里住着三块东西，**生命周期各不相同** —— 这是读它时最该先看清的地方：
  *
  *   1. 常驻（camera_init，main 在注册 App 之前调一次，之后永不拆）
- *        usb_camera  帧源。必须常驻：UVC 的"设备断开"是**流级**事件，
- *                    没有活着的流就收不到断开通知（详见 usb_camera.h）。
+ *        usb_camera  帧源。必须常驻：它按"摄像头是常驻外设"设计 —— init 时 open
+ *                    一条流，之后一直挂着，直到重启（不处理拔插，详见 usb_camera.h）。
  *        sd_save     拍照保存任务。必须常驻：它写盘期间一直持着 jbuf 的读槽，
  *                    中途被杀会让读槽永远释放不了（详见 sd_save_init 的注释）。
  *
  *   2. 每次进出（camera_enter / camera_leave）
- *        jpeg_decoder 实例  它吃的是"丢旧保新"的流，杀掉重启零损失，
- *                           所以按需建拆 —— 不进相机就不占那约 1.4MB PSRAM。
+ *        jpeg_decoder 引擎 + 一块 600KB 画布。不进相机就不占；没有任务，
+ *                     所以"拆"是平凡的（不像以前要等任务自己退出）。
  *        UI（一个 lv_image + 底部控制条 + 一个 20ms 定时器）
  *
  *   3. 拍照（on_shutter_clicked）只发一个信号，写盘在 sd_save_task 里做
@@ -20,12 +20,18 @@
  *   **有不可中断的临界区 -> 常驻；可随时打断 -> 动态。**
  * （sd_save 的临界区 = 持着 jbuf 读槽写盘；解码器没有任何临界区。）
  *
- * 裁剪自 demo1 的 app_camera.c。砍掉的是：自画顶栏、自定义字体与配色、圆形按钮。
- * 保留下来的是那套**持帧时序**（见 on_refresh）和"保存中冻结预览"的做法。
+ * 解码是**在 LVGL 定时器里同步做的**（见 on_refresh）：从 uvc_fb 取最新一帧 ->
+ * 解到解码器自己那块画布 -> 上屏。输出**只需要一个槽** —— 因为生产者和消费者
+ * 都是这个 LVGL 任务，而 LVGL 的重绘发生在定时器回调返回之后。
+ * 真正需要双缓冲的是帧源那侧（uvc_fb，生产者是异步的驱动回调）。
  *
- * 没插摄像头时会是什么样：frame_buf 的读槽从没被写过，初值指向它 -> **一片黑**。
- * 这是刻意从简（App 是验证台，不是产品）；排查时看 usb_camera 那三行 INFO
- * （"UVC device connected" → "UVC stream opened" → "stream started"）就知道流起没起来。
+ * 裁剪自 demo1 的 app_camera.c。砍掉的是：自画顶栏、自定义字体与配色、圆形按钮。
+ * 保留下来的是"保存中冻结预览"的做法。
+ *
+ * 没插摄像头时会是什么样：usb_camera_init 里那次 open 会失败（等 5s 超时），
+ * camera_init 直接返回错误 -> 解码器和保存任务都不会建 -> **一片黑**。
+ * 这是刻意从简（App 是验证台，不是产品）；排查时看 "UVC stream opened" 有没有出现，
+ * 以及进 App 时 "stream started" 有没有跟着出现。
  */
 #include "camera.h"
 
@@ -48,13 +54,16 @@
 #include "ui_status_bar.h"
 #include "picture.h"
 #include "usb_camera.h"
-#include "jpeg_decode_task.h"
+#include "jpeg_decoder.h"
 #include "sd_card.h"
 
 static const char *TAG = "camera";
 
 /* 刷新周期。画面是 30fps(33ms)，20ms 比它快一点，保证不落帧。
- * 定时器里只是 wait_new(0) 轮询 + 一次 set_src，代价很小。
+ *
+ * ⚠️ 定时器里现在做的是"查有没有新帧 -> 同步解码 -> 上屏"，一次要占约 4.9ms
+ *    （解码本身）—— 这段时间 LVGL 任务是**被挡住**的。20ms 的周期对 15.6fps 的
+ *    输入够用（平均每三次才真解一帧）。
  * （demo1 用同一个值） */
 #define REFRESH_MS 20
 
@@ -62,20 +71,19 @@ static const char *TAG = "camera";
  * 正好剩 72px 放这一条，不会压在画面上。 */
 #define CTRL_BAR_H 72
 
-/* 保存任务：优先级低于解码器(8)和 USB 驱动，写盘慢一点没关系，别抢它们的核 */
+/* 保存任务：优先级只高于 LVGL 任务，写盘慢一点没关系，别抢 USB 驱动的核 */
 #define SAVE_TASK_STACK 4096
 #define SAVE_TASK_PRIO  3
 #define SAVE_TASK_CORE  1
 
 /* ---- 界面 + 解码器：enter 建、leave 清 ---- */
-static jpeg_decode_t *s_jd         = NULL;
-static lv_obj_t      *s_scr        = NULL;
-static lv_obj_t      *s_image      = NULL;
-static lv_obj_t      *s_status     = NULL;    /* 控制条上的状态文字 */
-static lv_image_dsc_t s_dsc;
-static lv_timer_t    *s_timer      = NULL;
-static bool           s_frame_held = false;   /* 是否还压着一个读槽没还 */
-static bool           s_saving     = false;   /* 保存中：预览冻结在按快门那一帧 */
+static jpeg_decoder_t *s_jd         = NULL;
+static lv_obj_t       *s_scr        = NULL;
+static lv_obj_t       *s_image      = NULL;
+static lv_obj_t       *s_status     = NULL;    /* 控制条上的状态文字 */
+static lv_image_dsc_t  s_dsc;
+static lv_timer_t     *s_timer      = NULL;
+static bool            s_saving     = false;   /* 保存中：预览冻结在按快门那一帧 */
 
 /* ---- 常驻部分的状态（由 camera_init 设置） ---- */
 static bool           s_save_ready = false;   /* 保存任务是否就绪（没就绪时快门不响应） */
@@ -261,19 +269,18 @@ static bool sd_save_get_result(sd_save_result_t *out)
 /*
  * 定时器回调。跑在 LVGL 任务里（已持锁），所以里面不要再加 LVGL 锁。
  *
- * ⚠️ 这里的"持帧"思路来自 demo1，但**顺序必须是"先还再等"**，demo1 那份写反了：
+ * 每 20ms 一次：看看帧源有没有新帧，有就同步解一帧、上屏。
  *
- *    frame_buf 是"丢旧保新"语义 —— 生产者只有在 read_in_progress == false
- *    （读槽已释放）时才发布新帧、才 give 唤醒信号量。所以如果先 wait_new 再
- *    read_done，就会死锁：生产者发布不了 → 信号量永远是 0 → wait_new 永远超时
- *    → 读槽永远不释放。
- *    症状很典型：**进去显示一帧就冻住**，退出重进才换一张（leave 里会释放一次）。
+ * 流程很短，但有三条约束要记住：
  *
- *    正确顺序：① 先还上一帧（让生产者有机会发布）→ ② 再等新帧。
- *
- *    还有一点：等待失败时**不要**立刻把旧槽重新抓住 —— 那样生产者能发布的时间
- *    窗口只剩几微秒，几乎永远抓不到新帧（等于换个方式再冻住）。放弃这一轮、
- *    让它空着，生产者就有近一个定时器周期（20ms）去发布，下一轮必得。
+ *  ① **解码器没起来就只空转**（s_jd == NULL）：进 App 时建失败会走这条路，
+ *     界面已经显示了一行提示，定时器照跑但什么都不用做。
+ *  ② **读槽只在解码期间持有，解完立刻还。** uvc_fb 是"丢旧保新"语义 ——
+ *     生产者（驱动回调）只有在读槽没被占用时才能发布新帧，所以持有时间越短越好。
+ *     这里**不存在**以前那个"先还槽再等帧、反了就冻住"的死锁：等帧用的是非阻塞的
+ *     wait_new(0)，而且持槽期间不做任何等待。
+ *  ③ **解码失败不能动上一帧**：坏帧是预期内的（源头截断 / 拼帧溢出），这时接口
+ *     不会改写 out，画布还是上一帧的内容，直接让它留在屏幕上就行。
  */
 static void on_refresh(lv_timer_t *timer)
 {
@@ -295,26 +302,33 @@ static void on_refresh(lv_timer_t *timer)
     if (s_saving) {
         return;                     /* 保存中：画面停在按快门那一帧 */
     }
+    if (s_jd == NULL) {
+        return;                     /* 解码器没起来：界面已有提示，这里只空转 */
+    }
 
-    frame_buf_t *fb = jpeg_decode_get_fb(s_jd);
-    if (fb == NULL) {
+    /* ① 帧源有没新帧？没有就保持当前画面（wait_new 是非阻塞的） */
+    frame_buf_t *uvc_fb = usb_camera_get_fb();
+    if (uvc_fb == NULL || !frame_buf_wait_new(uvc_fb, 0)) {
         return;
     }
 
-    /* ① 先还掉上一帧的读槽。它在上一次 set_src 之后又过了 20ms，
-     *    LVGL 早就在这一轮的绘制里把它画完了，现在释放是安全的 */
-    if (s_frame_held) {
-        frame_buf_read_done(fb);
-        s_frame_held = false;
+    /* ② 取最新一帧，同步解码。这一下约 4.9ms（坏帧会走到引擎 15ms 的上限），
+     *    期间 LVGL 任务是被挡住的 —— 已知并接受，契约见 jpeg_decoder.h。 */
+    uint32_t len = 0;
+    const uint8_t *jpg = frame_buf_get_read(uvc_fb, &len);
+    uint8_t *out = NULL;
+    const esp_err_t err = jpeg_decode_frame(s_jd, jpg, len, &out);
+
+    /* ③ 立刻还读槽：解完就不需要这块输入了，让生产者尽早能发布下一帧 */
+    frame_buf_read_done(uvc_fb);
+
+    if (err != ESP_OK) {
+        return;                     /* 坏帧：画布内容没动，继续显示上一帧 */
     }
 
-    /* ② 再等新帧。到这一步读槽是空的，生产者随时能发布。
-     *    注意这里没有立即重新抓住旧槽 —— 见上面那段说明 */
-    if (!frame_buf_wait_new(fb, 0)) {
-        return;                     /* 这一轮还没有新帧：保持当前画面 */
-    }
-    s_dsc.data = frame_buf_get_read(fb, NULL);
-    s_frame_held = true;
+    /* ④ 上屏。画布指针始终是同一块（内容在原地被覆盖），set_src 照样每次都调 ——
+     *    它表达的就是"这一帧变了、去重绘"，而且这样不依赖"图片缓存是否关闭"这个配置。 */
+    s_dsc.data = out;
     lv_image_set_src(s_image, &s_dsc);
     lv_obj_invalidate(s_image);
 }
@@ -351,26 +365,18 @@ static void camera_enter(void)
 {
     ESP_LOGI(TAG, "enter");
 
-    /* ---- 1. 解码器按需建（每次进入约 1.4MB PSRAM + 一条任务）----
-     * 放在动 LVGL 之前，和下面 usb_camera_stream_request 同一种做法：
-     * "先把数据源备好，再画界面"。 */
-    s_jd = jpeg_decode_create(usb_camera_get_fb());
-    if (s_jd != NULL && jpeg_decode_start(s_jd) != ESP_OK) {
-        jpeg_decode_destroy(s_jd);
-        s_jd = NULL;
-    }
+    /* ---- 1. 解码器按需建（引擎 + 一块 600KB 画布）----
+     * 放在动 LVGL 之前，和下面开流同一种做法："先把数据源备好，再画界面"。
+     * 失败不致命：下面照样建 screen，只是显示一行提示。 */
+    s_jd = jpeg_decode_init();
     if (s_jd == NULL) {
-        /* ⚠️ 失败也**不能**直接 return：本函数必须保证最后有一张 screen 被 load。
-         *    否则 app_manager 接着会调 desktop_leave() 把桌面那张拆掉，
-         *    而这边什么都没建 —— LVGL 就没有有效 screen 了。
-         *    所以下面照样建 screen，只是显示一行提示。 */
         ESP_LOGE(TAG, "解码器没起来，只显示提示");
     }
 
-    /* ---- 2. 按需开流：这里只"表达意图"，真正的 start 在 usb_camera 的管理任务里做
-     * （那边和 open/close 同一任务、天然串行；而且 start 里含控制传输和 vTaskDelay，
-     * 不该让 UI 线程去等）。 ---- */
-    usb_camera_stream_request(true);
+    /* ---- 2. 开流。⚠️ **同步阻塞**（约 15~20ms），而且我们此刻正跑在 LVGL 任务里
+     * —— 这一下会卡住界面，已知并接受（契约见 usb_camera.h）。
+     * 返回值要留着：下面据此决定给"预览"还是给"一行提示"。 ---- */
+    const esp_err_t stream_err = usb_camera_stream_start();
 
     lvgl_port_lock(0);
 
@@ -383,13 +389,26 @@ static void camera_enter(void)
     };
     ui_status_bar_apply(&bar);
 
-    if (s_jd == NULL) {
+    /* 预览需要两样都在：解码器 + 流。任何一个没起来就只给一行提示 ——
+     * 这既是给用户看的，也是排查"为什么是一片黑"时的第一个线索。 */
+    if (s_jd == NULL || stream_err != ESP_OK) {
+        /* ⚠️ 这里**不能**直接 return：本函数必须保证最后有一张 screen 被 load。
+         *    否则 app_manager 接着会调 desktop_leave() 把桌面那张拆掉，而这边什么
+         *    都没建 —— LVGL 就没有有效 screen 了。所以照样建 screen，只给提示。 */
+        const char *text = "Decoder unavailable";
+        if (s_jd != NULL) {
+            /* 解码器没问题，是流没起来。再分两种（错误码含义见 usb_camera.h）：
+             *   INVALID_STATE = init 时就没 open（相机不在场）
+             *   其余          = 有流，但这次 start 失败（相机中途掉了 / 总线错） */
+            text = (stream_err == ESP_ERR_INVALID_STATE) ? "No camera" : "Stream error";
+        }
         lv_obj_t *msg = lv_label_create(s_scr);
-        lv_label_set_text(msg, "Decoder unavailable");
+        lv_label_set_text(msg, text);
         lv_obj_center(msg);
     } else {
-        /* LVGL 不认 frame_buf，得手工把"一块 RGB565 像素"描述出来。
-         * 尺寸就是解码器的输出尺寸，之后每帧只换 data 指针。 */
+        /* LVGL 不认解码器的画布，得手工把"一块 RGB565 像素"描述出来。
+         * 尺寸就是解码器的输出尺寸；画布指针自始至终是同一块（内容原地更新），
+         * 而 data 要等第一次成功解码才有值（见 on_refresh）。 */
         s_dsc.header.magic  = LV_IMAGE_HEADER_MAGIC;
         s_dsc.header.cf     = LV_COLOR_FORMAT_RGB565;
         s_dsc.header.w      = JPEG_DEC_FRAME_W;
@@ -397,16 +416,12 @@ static void camera_enter(void)
         s_dsc.header.stride = JPEG_DEC_FRAME_W * JPEG_DEC_FRAME_PIXEL;
         s_dsc.data_size     = JPEG_DEC_FRAME_BUF_SIZE;
 
-        /* ⚠️ data 初值必须指向**有效内存**（哪怕内容是黑的），否则 LVGL 绘制空 data
-         *    会崩。做法照抄 demo1：先借一次读槽当初始画面，立刻还回去。
-         *    没插摄像头时借到的就是那块没被写过的槽 → 显示为一片黑。 */
-        frame_buf_t *fb = jpeg_decode_get_fb(s_jd);
-        s_dsc.data = frame_buf_get_read(fb, NULL);
-        frame_buf_read_done(fb);
-        s_frame_held = false;
-
+        /* ⚠️ 这里**不**给 s_image 设 src —— 画布要等第一次成功解码才拿得到（接口在
+         *    jpeg_decode_frame 里给）。空 src 的 lv_image 什么都不画、不会崩，
+         *    所以不再需要以前那套"先借一次读槽当初始画面"。
+         *    尺寸显式设出来，定位就不依赖"src 什么时候到位"了。 */
         s_image = lv_image_create(s_scr);
-        lv_image_set_src(s_image, &s_dsc);
+        lv_obj_set_size(s_image, JPEG_DEC_FRAME_W, JPEG_DEC_FRAME_H);
         /* 画面 640×480 **原样、不缩放**（缩放要么软件要么 PPA，是另一个量级）。
          * LV_ALIGN_TOP_MID = 水平居中，纵向从状态栏下沿开始（用 lv_obj_align 而不是
          * 手算 (1024-640)/2，这样不用让 apps 依赖 lcd_screen 拿屏幕宽度）。 */
@@ -443,8 +458,10 @@ static void camera_leave(void)
 {
     ESP_LOGI(TAG, "leave");
 
-    /* 关流：同样只表达意图。用户已经不看了，就不该继续让摄像头推流、让解码器空跑 */
-    usb_camera_stream_request(false);
+    /* 关流：用户已经不看了，就不该继续让摄像头推流、让解码器空跑。
+     * 同样**同步阻塞**（stop 约 100ms）—— 退出相机 App 时这一下会卡住界面。
+     * 返回值**故意忽略**：停不掉也没什么可做的（本组件不重连）。 */
+    usb_camera_stream_stop();
 
     lvgl_port_lock(0);
 
@@ -456,21 +473,19 @@ static void camera_leave(void)
         s_timer = NULL;
     }
 
-    /* ② 还掉可能还压着的读槽。不还的话，解码器的 commit 会一直失败
-     *    （丢旧保新 -> 帧被连续丢弃），再回到这个 App 就一直没有画面了。 */
-    if (s_frame_held) {
-        frame_buf_read_done(jpeg_decode_get_fb(s_jd));
-        s_frame_held = false;
-    }
-
-    /* ③ 拆解码器。顺序不能颠倒：s_dsc.data 指着 jd->fb 里那块内存，
-     *    所以必须"先还读槽 -> 拆解码器 -> 最后异步删 screen"（和 photo.c 一致）。
-     * ⚠️ jpeg_decode_destroy 内部要等解码任务自己退出（100ms 轮询一轮），实测约
-     *    100ms；这一步是在**持着 LVGL 锁**的情况下等的 —— 退相机会有一瞬间的停顿。 */
+    /* ② 拆解码器：引擎和那块 600KB 画布一起释放。这里**没有等待** ——
+     *    同步解码没有任务，"拆"就是两个 free。
+     *
+     *    安全性来自 app_manager 的切换顺序（enter(新) → leave(旧)）：走到这里时
+     *    相机这张 screen 已经不在台面上了，不会再有人去画那块画布。
+     *
+     *    以前那条"先还读槽 -> 再拆解码器"的顺序纪律也不需要了：输出不再是
+     *    frame_buf，没有"读槽"这回事（输入侧的读槽在 on_refresh 里当场就还了）。 */
     if (s_jd != NULL) {
-        jpeg_decode_destroy(s_jd);
+        jpeg_decode_deinit(s_jd);
         s_jd = NULL;
     }
+    s_dsc.data = NULL;              /* 画布已经没了，别留一个指向已释放内存的指针 */
 
     lv_obj_delete_async(s_scr);
     s_scr = NULL;
@@ -485,8 +500,8 @@ static void camera_leave(void)
 
 esp_err_t camera_init(void)
 {
-    /* 1. USB Host + UVC 驱动 + 帧源。必须常驻 ——
-     *    理由见 usb_camera.h 里 usb_camera_init() 的说明（UVC 的断开事件是流级的）。 */
+    /* 1. USB Host + UVC 驱动 + 帧源。这里会**同步等摄像头就位**并 open 那唯一一条
+     *    流（最多 5s），失败即返回错误 —— 本组件不重连，详见 usb_camera.h。 */
     esp_err_t err = usb_camera_init();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "usb_camera_init failed: %s", esp_err_to_name(err));
