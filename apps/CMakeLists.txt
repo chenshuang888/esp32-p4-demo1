@@ -20,6 +20,8 @@ idf_component_register(
         picture
         usb_camera
         jpeg_decoder
+        avi_writer
+        avi_reader
         frame_buf
         sd_card
 )

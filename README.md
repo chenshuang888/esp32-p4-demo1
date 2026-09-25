@@ -48,7 +48,9 @@ components/
   sd_card/           能力：SD 卡挂载（之后用 POSIX 文件 API）
   frame_buf/         能力：双缓冲原语（丢旧保新 + 读槽占用保护）
   jpeg_decoder/      能力：JPEG → RGB565（**同步一次性**；输入是裸指针，不认识 frame_buf）
-  usb_camera/        能力：UVC 流 → 拼接成完整 JPEG 帧，并扇出一份给拍照
+  avi_writer/        能力：把一串 JPEG 帧写成 MJPEG-in-AVI 文件（同步；不认识相机/存储）
+  avi_reader/        能力：从 MJPEG-in-AVI 文件里顺序取出 JPEG 帧（同步；不认识播放器）
+  usb_camera/        能力：UVC 流 → 拼接成完整 JPEG 帧，并扇出两份给拍照与录像
 ```
 
 依赖方向单向：`main` → { `apps`, `ui` } → `lcd_screen`；能力组件之间不互相认识，
@@ -82,8 +84,8 @@ components/
 | Desktop | `apps/desktop.c` | 主页：遍历注册表生成图标栅格（6×3），点击启动；底部显示 free heap 便于观察进出 App 有无泄漏 |
 | Demo | `apps/app_demo.c` | 验证 app_manager 调度 + kv_store 持久化：`count` 每次进入归零（说明页面真被重建），`total` 存在 NVS 里重启接着累加 |
 | Clock | `apps/clock.c` | 每秒刷新的时间显示；演示"游离定时器必须在 leave 里删掉" |
-| Camera | `apps/camera.c` | USB 摄像头预览（640×480 原样不缩放）+ 快门拍照存 SD 卡 |
-| Photos | `apps/photo.c` | 相册：列 `/sdcard/DCIM` 里的 jpg，点开解码上屏；验证"SD 读文件 → 解码 → 上屏" |
+| Camera | `apps/camera.c` | USB 摄像头预览（640×480 原样不缩放）+ 快门拍照存 SD 卡 + 录像存 SD 卡（MJPEG 包成 AVI，PC 可直接播） |
+| Photos | `apps/photo.c` | 相册：列 `/sdcard/DCIM` 里的 jpg + avi。照片点开解码上屏；视频点开自动播放（点画面暂停/继续，播完停在末帧再点回列表）。验证"SD 读文件 → （解封装）→ 解码 → 上屏" |
 
 ## 加一个 App 的步骤
 
@@ -111,7 +113,11 @@ components/
 | frame_buf 必须"先还读槽再等新帧"，反了会死锁（症状：进去显示一帧就冻住） | `apps/camera.c` 的 `on_refresh` |
 | PSRAM 对齐不能写死 64：L2 cache line 是 128B，不对齐解码器直接报错 | `components/frame_buf/frame_buf.c` |
 | JPEG 输出缓冲尺寸/对齐由 IDF 校验，改分辨率要连着改三处 | `components/jpeg_decoder/jpeg_decoder.c` |
-| 拍照文件名必须扫目录取最大编号 +1，静态递增序号重启会覆盖旧照片 | `apps/camera.c` 的 `sd_next_photo_path` |
+| 拍照文件名必须扫目录取最大编号 +1，静态递增序号重启会覆盖旧照片 | `apps/camera.c` 的 `sd_next_media_path` |
+| **往 SD 写大块時，源缓冲必须 128B 对齐**（`heap_caps_aligned_alloc(128, ...)`），否则 `sdmmc_write_sectors()` 会**静默**降级成 512B 单块写，速度掉 ~20 倍（实测 3.1MB/s → 0.13MB/s），且无任何报错 | `avi_writer.c` 顶部注释；`sdmmc_cmd.c:448` |
+| 拍照与录像必须各用一份 frame_buf（`jbuf` / `rbuf`）：单读者只是约定，`frame_buf_get_read` 不看是否已有读者，共用会踩对方正在读的槽 | `usb_camera.c` 的 `frame_callback` |
+| 录像任务必须常驻：写盘期间持着 rbuf 读槽，被杀会让读槽永远释放不了 | `apps/camera.c` 的 `record_task` |
+| AVI 头的大小/帧数要等收尾回填；退出相机 App 前必须先停录并等它 `close`，否则留下的文件是坏的 | `apps/camera.c` 的 `camera_leave` / `avi_writer.c` |
 | 相册解码：上一次的读槽要"下次解码前"才还，早了会画到已释放内存 | `apps/photo.c` 的 `photo_show` |
 | USB Host 两项配置是 UVC 能枚举的前提（不是调优项） | `sdkconfig.defaults` |
 | SD 卡那条 LDO "voltage 0 out of range" 警告可忽略且无法消除 | `components/sd_card/sd_card.c` |
@@ -122,7 +128,9 @@ components/
 demo1 有的、这里已覆盖：桌面、app_manager、相机（+ 拍照存卡）、相册、屏幕/触摸、SD 卡。
 
 这里多出来的：`kv_store`、`time_service`、全局状态栏、`picture` 图片资源组件、
-Clock / Demo 两个 App，以及**每个 App 的 enter/leave 生命周期与资源回收纪律**
+Camera 的**录像能力**（`avi_writer` + 常驻录像任务）与相册的**视频播放**（`avi_reader`
++ 同步播放定时器）、Clock / Demo 两个 App，
+以及**每个 App 的 enter/leave 生命周期与资源回收纪律**
 （demo1 的 App 是 `create_screen/destroy_screen`，没有回收约定）。
 
 demo1 里有、这里**还没做**的：画板 App（`demo1/app/app_paint.c`）。

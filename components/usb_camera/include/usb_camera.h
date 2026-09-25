@@ -39,6 +39,17 @@ frame_buf_t *usb_camera_get_fb(void);
 frame_buf_t *usb_camera_get_jbuf(void);
 
 /**
+ * @brief 获取录像用的 JPEG 帧缓冲（帧回调填的**第三份**拷贝），供 相机 App 的录像任务 消费
+ *
+ * 和 get_jbuf() 同一个道理，也是单读者。**为什么不和 get_jbuf() 共用一份**：
+ * frame_buf 的单读者已述只是约定、代码不强制（frame_buf_get_read() 不看是否已有读者），
+ * 拍照与录像共用一份时，两边会读到同一个槽、先完成的 read_done 放掉后驱动就覆盖了
+ * 另一边的内存。各自一份从根上消除这个隐患。语义同样是"丢旧保新"：录像任务写盘
+ * 期间提交的新帧会被自动丢弃。
+ */
+frame_buf_t *usb_camera_get_rbuf(void);
+
+/**
  * @brief 开始推流（由相机 App 的 enter 调用）
  *
  * ⚠️ **阻塞**：内部直接调驱动的 start，约 15~20ms（两次控制传输 + 10ms 设备间隔，

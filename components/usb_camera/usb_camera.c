@@ -58,7 +58,8 @@
 
 typedef struct {
     frame_buf_t *uvc_fb;                     /* 帧数据落点(生产者=驱动回调,消费者=解码器) */
-    frame_buf_t *jbuf;                       /* 同一份 JPEG 的第二份拷贝(消费者=相机 App 的保存任务) */
+    frame_buf_t *jbuf;                       /* 同一份 JPEG 的第二份拷贝(消费者=相机 App 的拍照保存任务) */
+    frame_buf_t *rbuf;                       /* 同一份 JPEG 的第三份拷贝(消费者=相机 App 的录像任务) */
 } usb_cam_frame_t;
 
 /* =====================================================================
@@ -201,19 +202,25 @@ esp_err_t usb_camera_stream_stop(void)
 
 /* ---- 生产者:驱动拼好一帧,直接 memcpy 进 frame_buf 写槽并发布。
  *
- * 一帧要**扇出成两份**,因为 frame_buf 是单读者(read_in_progress 是一个 bool,
- * 见 frame_buf.c):一份 frame_buf 只能有一个消费者。两个消费者是:
- *     uvc_fb -> 解码器 (JPEG -> RGB565 -> 上屏)
- *     jbuf   -> 相机 App 的保存任务 (原样写进 SD 卡,拍照用)
- * 所以"一帧给两个人看"必然有一次拷贝 —— 这次拷贝放在这里,换来的是解码器
- * 从此只管"JPEG 进、RGB565 出",不认识存储。
+ * 一帧要**扇出成三份**,因为 frame_buf 是单读者(read_in_progress 是一个 bool,
+ * 见 frame_buf.c):一份 frame_buf 只能有一个消费者。三个消费者是:
+ *     uvc_fb -> 解码器    (JPEG -> RGB565 -> 上屏)
+ *     jbuf   -> 拍照保存任务 (原样写进 SD 卡,拍照用)
+ *     rbuf   -> 录像任务     (原样按序写进 AVI 文件,录像用)
+ * 所以"一帧给三个人看"必然有两次拷贝 —— 这些拷贝放在这里,换来的是解码器/拍照/
+ * 录像三者从此互不认识,各自只管自己那份输入。
+ *
+ * ⚠️ 为什么拍照和录像不共用一份(非要付第三次拷贝)? 因为 frame_buf 的"单读者"
+ *    是约定,代码不强制:frame_buf_get_read() 不检查是否已有读者。若两者共用一份,
+ *    一个读盘未读完时另一个也 get_read 到同一个槽,先完成的那个 read_done 一放,
+ *    驱动立刻覆盖该槽,另一个还在读 -> 内存被踩。各自一份从根上消除这个隐患。
  *
  * 跑在驱动后台任务("USB-UVC")里,所以必须够快:
- *     两次 memcpy(实测 20~68KiB/帧)      约 0.4~1.0ms
+ *     三次 memcpy(实测 20~68KiB/帧)      约 0.6~1.5ms
  *   + 被唤醒的消费者(解码器)可能插进来    几十~几百 μs
- *   = 最坏约 2.5ms,而 URB 链路的安全余量约 23ms
+ *   = 最坏约 3ms,而 URB 链路的安全余量约 23ms
  *     (单个 URB 约 11.6ms 填满,回调期间还有 2 个在排队;推导见 uvc_host_install
- *      那段的注释)。余量十几倍,而且每帧只发生一次(实测 15.6fps,约 64ms 一次)。
+ *      那段的注释)。余量近十倍,而且每帧只发生一次(实测 15.6fps,约 64ms 一次)。
  *
  * 相比"另起拷贝任务 + 队列"的写法,这里省掉一个常驻任务、一个队列和每帧
  * 一次任务切换;更重要的是**我们从头到尾不持有 UVC 帧** —— 返回 true 之后
@@ -225,7 +232,7 @@ static bool frame_callback(const uvc_host_frame_t *frame, void *user_ctx)
 {
     (void)user_ctx;
 
-    /* 两个槽一样大(UVC_FRAME_BUF_SIZE),所以这一处长度检查同时管住两份拷贝 */
+    /* 三个槽一样大(UVC_FRAME_BUF_SIZE),所以这一处长度检查同时管住三份拷贝 */
     if (frame->data_len > UVC_FRAME_BUF_SIZE) {
         ESP_LOGW(TAG, "frame %u exceeds slot %u, dropped",
                  (unsigned)frame->data_len, (unsigned)UVC_FRAME_BUF_SIZE);
@@ -237,10 +244,15 @@ static bool frame_callback(const uvc_host_frame_t *frame, void *user_ctx)
     memcpy(slot, frame->data, frame->data_len);
     frame_buf_commit(s_frame.uvc_fb, frame->data_len);
 
-    /* ② 给 相机 App 的保存任务(拍照)。消费者忙(正在写盘)时 commit 返回 false 自动丢本帧 */
+    /* ② 给 相机 App 的拍照保存任务。消费者忙(正在写盘)时 commit 返回 false 自动丢本帧 */
     uint8_t *jslot = frame_buf_get_write(s_frame.jbuf);
     memcpy(jslot, frame->data, frame->data_len);
     frame_buf_commit(s_frame.jbuf, frame->data_len);
+
+    /* ③ 给 相机 App 的录像任务。同上,录像任务写 SD 期间 commit 返回 false 自动丢本帧 */
+    uint8_t *rslot = frame_buf_get_write(s_frame.rbuf);
+    memcpy(rslot, frame->data, frame->data_len);
+    frame_buf_commit(s_frame.rbuf, frame->data_len);
 
     return true;    /* 处理完了,所有权立刻还给驱动 */
 }
@@ -248,7 +260,8 @@ static bool frame_callback(const uvc_host_frame_t *frame, void *user_ctx)
 /* =====================================================================
  * 分区 C：帧缓冲暴露
  *   uvc_fb -> 解码器（消费 JPEG 帧）
- *   jbuf   -> 相机 App 的保存任务（拍照时原样写卡）
+ *   jbuf   -> 相机 App 的拍照保存任务（拍照时原样写卡）
+ *   rbuf   -> 相机 App 的录像任务（录像时按序写 AVI 文件）
  * ===================================================================== */
 
 frame_buf_t *usb_camera_get_fb(void)
@@ -259,6 +272,11 @@ frame_buf_t *usb_camera_get_fb(void)
 frame_buf_t *usb_camera_get_jbuf(void)
 {
     return s_frame.jbuf;
+}
+
+frame_buf_t *usb_camera_get_rbuf(void)
+{
+    return s_frame.rbuf;
 }
 
 /* =====================================================================
@@ -280,7 +298,7 @@ esp_err_t usb_camera_init(void)
         return ESP_ERR_NO_MEM;
     }
 
-    /* 同一份 JPEG 的第二份拷贝落点:消费者是 相机 App 的保存任务(拍照写 SD 卡)。
+    /* 同一份 JPEG 的第二份拷贝落点:消费者是 相机 App 的拍照保存任务(拍照写 SD 卡)。
      * 槽大小与 uvc_fb 相同即可 —— 超过 UVC_FRAME_BUF_SIZE 的帧在 frame_callback
      * 入口就已经丢了,所以这里不需要更大的槽,也不需要再判长度。 */
     const frame_buf_cfg_t jbuf_cfg = {
@@ -290,6 +308,19 @@ esp_err_t usb_camera_init(void)
     s_frame.jbuf = frame_buf_create(&jbuf_cfg);
     if (s_frame.jbuf == NULL) {
         ESP_LOGE(TAG, "jbuf frame_buf_create failed");
+        return ESP_ERR_NO_MEM;
+    }
+
+    /* 同一份 JPEG 的第三份拷贝落点:消费者是 相机 App 的录像任务(录像写 AVI)。
+     * 同样大小。多出一个 2×80KB 的常驻缓冲,换来拍照/录像各自独占一份输入、
+     * 不会互踩对方正在读的槽(见 frame_callback 顶部那段)。 */
+    const frame_buf_cfg_t rbuf_cfg = {
+        .slot_size = UVC_FRAME_BUF_SIZE,
+        .has_len = true,
+    };
+    s_frame.rbuf = frame_buf_create(&rbuf_cfg);
+    if (s_frame.rbuf == NULL) {
+        ESP_LOGE(TAG, "rbuf frame_buf_create failed");
         return ESP_ERR_NO_MEM;
     }
 
