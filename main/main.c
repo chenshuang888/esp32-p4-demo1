@@ -20,6 +20,7 @@
 #include "clock.h"
 #include "camera.h"
 #include "photo.h"
+#include "settings.h"
 #include "time_service.h"
 #include "kv_store.h"
 #include "sd_card.h"
@@ -88,19 +89,33 @@ void app_main(void)
     /* WiFi：由板载 ESP32-C6 协处理器提供（P4 通过 SDIO 与它通信）。
      * 同样**非阻塞 + 失败不 panic** —— 网络是外设，不该决定能不能开机。
      * 连上与否看 wifi_service 打的日志（"拿到 IP: ..."）。
-     * ⚠️ 必须在 kv_init() 之后：esp_wifi 要用 NVS 存配置。
-     * 放在 camera_init 之前，是为了不被相机那 5s 的等待拖住（见下）。
-     *
-     * ⚠️ **现在连不上是预期的**：wifi_service 目前不带凭据（空壳阶段），
-     *    connect() 会拒绝并打一条日志。保留这个调用是为了让编排形状一次到位 ——
-     *    等设置 App 做好，在它前面把凭据从 kv_store 读出来喂给 wifi_service，
-     *    这条链路就通了。 */
+     * ⚠️ 必须在 kv_init() 之后：esp_wifi 要用 NVS 存配置，而且下面就要读 kv_store。
+     * 放在 camera_init 之前，是为了不被相机那 5s 的等待拖住（见下）。 */
     if (wifi_service_init() != ESP_OK) {
         ESP_LOGW(TAG, "WiFi 未启动，网络功能不可用");
     } else {
-        /* 只发起连接，**不在这里等 IP** —— 等待会拖住开机（UI 还没建起来）。
-         * 想"先扫描看清楚再连"，调 wifi_service_scan()（阻塞 2~4 秒）。 */
-        wifi_service_connect();
+        /* 凭据由 main 从 kv_store 读出来喂进组件 —— wifi_service **不认识 NVS**，
+         * 这和 time_service_set() 是同一个模式：谁组装谁负责把外部输入接进来。
+         * 键名常量（WIFI_CFG_*）定义在 wifi_service.h，和设置 App 写入时用的是同一份。
+         *
+         * 读不到 = 还没配过：保持"没有凭据"的状态，wifi_service_connect() 会拒绝。
+         * 用户在设置 App 里配一次就会写进这里，下次开机自动生效。 */
+        char ssid[33] = { 0 };
+        char pass[64] = { 0 };
+
+        if (kv_read_str(WIFI_CFG_NS, WIFI_CFG_KEY_SSID, ssid, sizeof(ssid)) == ESP_OK &&
+            ssid[0] != '\0') {
+            /* 密码读不到就当空串（开放网络），所以不把它的返回值当错 */
+            kv_read_str(WIFI_CFG_NS, WIFI_CFG_KEY_PASS, pass, sizeof(pass));
+            if (wifi_service_set_credentials(ssid, pass) == ESP_OK) {
+                ESP_LOGI(TAG, "用已保存的凭据连接 WiFi: %s", ssid);
+                /* 只发起连接，**不在这里等 IP** —— 等待会拖住开机（UI 还没建起来）。
+                 * 想"先扫描看清楚再连"，调 wifi_service_scan()（阻塞 2~4 秒）。 */
+                wifi_service_connect();
+            }
+        } else {
+            ESP_LOGI(TAG, "还没有保存的 WiFi 凭据（去设置 App 里配）");
+        }
     }
 
     /* ---- 相机链路：USB Host + UVC 驱动 + 拍照保存任务 ----
@@ -130,6 +145,7 @@ void app_main(void)
     clock_register();
     camera_register();
     photo_register();
+    settings_register();
 
     /* ---- 4. UI 层：接入 LVGL ---- */
     ESP_ERROR_CHECK(ui_init());

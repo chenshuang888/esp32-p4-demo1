@@ -10,6 +10,7 @@ idf_component_register(
         "clock.c"
         "camera.c"
         "photo.c"
+        "settings.c"
     INCLUDE_DIRS
         "include"
     REQUIRES
@@ -24,4 +25,6 @@ idf_component_register(
         avi_reader
         frame_buf
         sd_card
+        lcd_screen      # settings.c 直接用 LCD_SCREEN_*_RES 算布局
+        wifi_service    # settings.c 扫描 / 设凭据 / 连接
 )

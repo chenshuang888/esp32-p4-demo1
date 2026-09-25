@@ -45,6 +45,7 @@ components/
   picture/           图片资源：壁纸与图标（数据由脚本生成）
   kv_store/          能力：键值存储（NVS 后端）
   time_service/      能力：时间（对时 + 时区，不认识任何时间源）
+  wifi_service/      能力：WiFi（板载 C6 走 SDIO；**不认识 NVS**，凭据由调用方喂进来）
   sd_card/           能力：SD 卡挂载（之后用 POSIX 文件 API）
   frame_buf/         能力：双缓冲原语（丢旧保新 + 读槽占用保护）
   jpeg_decoder/      能力：JPEG → RGB565（**同步一次性**；输入是裸指针，不认识 frame_buf）
@@ -72,9 +73,12 @@ components/
   输入缓冲）在 `enter` 建、`leave` 拆；反过来，**有不可中断临界区**的东西必须常驻
   （拍照保存任务写盘期间持着 jbuf 读槽，中途被杀会让读槽永远释放不了）。
   完整说明见 `apps/camera.c` 顶部。
-- 状态栏的标题/返回按钮由 `components/ui/ui_status_bar.h` 统一提供：
-  App 在 `enter` 里 `ui_status_bar_apply()` 填标题，内容从 `UI_STATUS_BAR_HEIGHT`
-  往下排，**自己不要画标题和返回按钮**。
+- 状态栏的标题/"回桌面"按钮由 `components/ui/ui_status_bar.h` 统一提供：
+  App 在 `enter`（或每次切页）时 `ui_status_bar_apply()` 填标题，内容从
+  `UI_STATUS_BAR_HEIGHT` 往下排，**自己不要再画一个回桌面的按钮**。
+  ⚠️ App **内部**页面的"上一级"按钮不属于这一条 —— 那个语义是"退一层"，
+  和状态栏的"回桌面"各管一段，App 可以自己画。见 `apps/settings.c`
+  （它用 `< Settings` / `< WiFi` 这类措辞和状态栏的 `Back` 区分开）。
 - 全项目**不显式设置字体**，字号由 `CONFIG_LV_FONT_DEFAULT_MONTSERRAT_18` 一处决定。
 
 ## 现有 App
@@ -86,6 +90,7 @@ components/
 | Clock | `apps/clock.c` | 每秒刷新的时间显示；演示"游离定时器必须在 leave 里删掉" |
 | Camera | `apps/camera.c` | USB 摄像头预览（640×480 原样不缩放）+ 快门拍照存 SD 卡 + 录像存 SD 卡（MJPEG 包成 AVI，PC 可直接播） |
 | Photos | `apps/photo.c` | 相册：列 `/sdcard/DCIM` 里的 jpg + avi。照片点开解码上屏；视频点开自动播放（点画面暂停/继续，播完停在末帧再点回列表）。验证"SD 读文件 → （解封装）→ 解码 → 上屏" |
+| Settings | `apps/settings.c` | 设置：设置列表 →（点 WiFi）WiFi 列表（扫描，按信号从强到弱排）→（点某个 SSID）输密码 → 连接。凭据存 NVS，开机由 main 读出来自动连。验证"扫描 → 选网 → 输密码 → 连上"整条链路 |
 
 ## 加一个 App 的步骤
 
@@ -122,14 +127,16 @@ components/
 | USB Host 两项配置是 UVC 能枚举的前提（不是调优项） | `sdkconfig.defaults` |
 | SD 卡那条 LDO "voltage 0 out of range" 警告可忽略且无法消除 | `components/sd_card/sd_card.c` |
 | 图标源图不能带水印，否则内容边界会变成整张图 | `components/picture/picture.c` 顶部 |
+| 进 WiFi 列表时**扫描是同步阻塞的**（2~4 秒，界面冻住）；`lv_refr_now()` 是为了让 "Scanning..." 能显示出来，不然连提示都看不到 | `apps/settings.c` 的 `wifi_start_scan` |
+| 中文 SSID 会显示成**一串占位方块**（项目没有中文字体）。不是空白 —— `LV_USE_FONT_PLACEHOLDER` 默认开会画方块 | `components/wifi_service/wifi_service.h` 的 `wifi_service_ap_t` |
 
 ## 与 demo1 的关系
 
 demo1 有的、这里已覆盖：桌面、app_manager、相机（+ 拍照存卡）、相册、屏幕/触摸、SD 卡。
 
-这里多出来的：`kv_store`、`time_service`、全局状态栏、`picture` 图片资源组件、
+这里多出来的：`kv_store`、`time_service`、`wifi_service`、全局状态栏、`picture` 图片资源组件、
 Camera 的**录像能力**（`avi_writer` + 常驻录像任务）与相册的**视频播放**（`avi_reader`
-+ 同步播放定时器）、Clock / Demo 两个 App，
++ 同步播放定时器）、Clock / Demo / Settings 三个 App，
 以及**每个 App 的 enter/leave 生命周期与资源回收纪律**
 （demo1 的 App 是 `create_screen/destroy_screen`，没有回收约定）。
 

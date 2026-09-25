@@ -41,22 +41,19 @@
 
 static const char *TAG = "wifi";
 
-/* ===================== 凭据：本组件不带 =====================
- * 本组件**不自带任何 SSID / 密码**，也不认识 NVS。
- * 凭据将来由**设置 App** 输入 → 存进 kv_store(NVS) → 由 main（编排层）读出来喂进来。
+/* ===================== 凭据：本组件不带，也不存 =====================
+ * 本组件**不自带任何 SSID / 密码**，也**不认识 NVS**。
+ * 凭据由调用方喂进来（wifi_service_set_credentials()）：
+ *   设置 App 输入 → 写 kv_store → 之后每次开机由 main 读出来喂进来。
  * 这就是 time_service 的模式：组件不认识时间源，值由 main 用 time_service_set() 喂。
  *
- * ⚠️ 在那条路走通之前，这里是**空壳**：init() 不设凭据，connect() 一律拒绝。
- *    也就是说**板子现在连不上 WiFi —— 这是刻意的，不是缺陷**。
- *    换来的是：源码里再也没有一个字节的凭据。
+ * 结果是**源码里永远没有一个字节的凭据**；而且"凭据存哪"只由头文件里
+ * WIFI_CFG_* 那一份常量约定，写入方和读出方不会各写各的。
  */
 
 /* 连不上时重试几次就放弃。只为压制日志噪音 —— 放弃后**不重启也不阻塞谁**，
  * 只是不再自动重连（想再来一次就重启板子）。 */
 #define WIFI_MAX_RETRY  5
-
-/* 一次最多列多少个扫描结果。只影响日志长度，不影响扫描本身。 */
-#define WIFI_SCAN_MAX   32
 
 static EventGroupHandle_t s_events;         /* NULL = init 没成功过 */
 #define WIFI_CONNECTED_BIT  BIT0            /* 已拿到 IP */
@@ -64,6 +61,14 @@ static EventGroupHandle_t s_events;         /* NULL = init 没成功过 */
 static int  s_retry  = 0;
 static bool s_inited = false;
 static esp_netif_t *s_netif = NULL;         /* init 时建好的 STA netif，wifi_service_get_ip() 要用 */
+
+/* 驱动里已经设过凭据了吗。没有就拒绝 connect() —— 刻意不去赌驱动 flash 里
+ * 残留的旧配置，那样"能不能连上"取决于上次烧过什么，是最难查的一类问题。 */
+static bool s_has_creds = false;
+
+/* 上一次断开的原因，给界面翻译成人话用。
+ * 每次 connect() 清零、每次断开更新 —— 所以读到的一定是本次尝试的原因。 */
+static uint8_t s_last_disc_reason = 0;
 
 /* auth mode → 字符串。只列我们认得的，其余交给 default。
  *
@@ -88,6 +93,36 @@ static const char *auth_mode_str(wifi_auth_mode_t m)
     }
 }
 
+/*
+ * 把一份凭据填进驱动配置并交给 esp_wifi。
+ *
+ * 这里是两个坑的唯一落点（别把它们散到调用方去）：
+ *
+ *   1. `threshold.authmode` 是**"可接受的最弱加密"**，不是"目标网络的加密方式"。
+ *      开放 AP 若被要求 WPA2 会被**直接拒绝** —— 症状只是"连不上但看不出任何原因"。
+ *      所以它必须由"密码是否为空"推出，而不是由调用方配一个独立的值。
+ *
+ *   2. ssid / password 是以 0 结尾的**定长数组**，要用带精度的 snprintf
+ *      （%.31s / %.63s = 数组长度 - 1）。不带精度、源串又更长时，
+ *      GCC 会以 -Werror=format-truncation 直接报错（photo.c 里踩过同一个坑）。
+ */
+static esp_err_t apply_config(const char *ssid, const char *password)
+{
+    wifi_config_t cfg = { 0 };
+    snprintf((char *)cfg.sta.ssid, sizeof(cfg.sta.ssid), "%.31s", ssid);
+    snprintf((char *)cfg.sta.password, sizeof(cfg.sta.password), "%.63s", password);
+    cfg.sta.threshold.authmode = (password[0] == '\0') ? WIFI_AUTH_OPEN : WIFI_AUTH_WPA2_PSK;
+
+    const esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_set_config 失败: %s", esp_err_to_name(err));
+        return err;
+    }
+    ESP_LOGI(TAG, "已设置凭据：SSID=\"%s\"，%s",
+             ssid, (password[0] == '\0') ? "开放网络（无密码）" : "需要密码");
+    return ESP_OK;
+}
+
 /* ===================== 事件回调 =====================
  * 跑在**默认事件循环任务**里，不是 LVGL 任务 ——
  * 所以这里千万不要碰 lv_xxx / lvgl_port_lock。
@@ -104,8 +139,10 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         const wifi_event_sta_disconnected_t *ev = (const wifi_event_sta_disconnected_t *)data;
         xEventGroupClearBits(s_events, WIFI_CONNECTED_BIT);
+        s_last_disc_reason = (uint8_t)ev->reason;
         /* reason 是排查的关键：201 = NO_AP_FOUND（多半是压根没扫到，比如目标只在 5G），
-         * 15 = 4WAY_HANDSHAKE_TIMEOUT（多半是密码错），202 = AUTH_FAIL。 */
+         * 15 = 4WAY_HANDSHAKE_TIMEOUT（多半是密码错），202 = AUTH_FAIL。
+         * 同一个值也会被设置 App 读走，翻译成人话显示在界面上。 */
         if (s_retry < WIFI_MAX_RETRY) {
             s_retry++;
             ESP_LOGW(TAG, "连接断开 (reason=%d)，重试 %d/%d",
@@ -186,20 +223,13 @@ esp_err_t wifi_service_init(void)
         return err;
     }
 
-    /* ⚠️ 这里刻意**不调 esp_wifi_set_config()** —— 本组件已经不带凭据（见文件上方）。
-     *    设置 App 做好后，凭据由 main 读出来喂进来，那一刻在这里补上 set_config。
-     *    到那时有两个坑必须记住（原来是代码，现在只是注释）：
-     *      1. `threshold.authmode` 是**"可接受的最弱加密"**，不是"目标网络的加密方式"。
-     *         开放 AP 若被要求 WPA2 会被**直接拒绝**，症状是"连不上但看不出原因"。
-     *         所以必须由"密码是否为空"推出，而不是写死：
-     *             authmode = password[0] ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
-     *      2. ssid / password 是以 0 结尾的定长数组，要用 snprintf 且带 "%.31s" / "%.63s"
-     *         精度。不带精度、源串又更长时 GCC 会以 -Werror=format-truncation 报错
-     *         （photo.c 里踩过同一个坑）。 */
+    /* ⚠️ init 刻意**不设凭据** —— 凭据由调用方调 wifi_service_set_credentials()
+     *    喂进来（开机时 main 从 kv_store 读，用户改配置时由设置 App 写）。
+     *    本组件不认识 NVS，也不带任何默认凭据（见文件上方）。 */
 
     /* 只 start，不 connect —— 连接是 wifi_service_connect() 的事。
      * ⚠️ esp_wifi 默认用 WIFI_STORAGE_FLASH，会把配置写进 NVS —— 这也是本组件
-     *    要求"调用前 NVS 已初始化"的原因（即使目前没有凭据可存）。 */
+     *    要求"调用前 NVS 已初始化"的原因（即使此刻还没有凭据可存）。 */
     err = esp_wifi_start();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_wifi_start 失败: %s", esp_err_to_name(err));
@@ -207,19 +237,26 @@ esp_err_t wifi_service_init(void)
     }
 
     s_inited = true;
-    ESP_LOGI(TAG, "WiFi 已就绪（STA 模式；尚无凭据，等设置 App）");
+    ESP_LOGI(TAG, "WiFi 已就绪（STA 模式，等待凭据）");
     return ESP_OK;
 }
 
-esp_err_t wifi_service_scan(void)
+esp_err_t wifi_service_scan(wifi_service_ap_t *out, size_t cap, size_t *count)
 {
+    if (out == NULL || count == NULL || cap == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *count = 0;
+
     if (!s_inited) {
         ESP_LOGE(TAG, "还没 init，不能扫描");
         return ESP_ERR_INVALID_STATE;
     }
 
-    /* 全部信道、全部 SSID（含隐藏 SSID）。block=true 表示扫完才返回。 */
-    const wifi_scan_config_t scan_cfg = { .show_hidden = true };
+    /* 全部信道。show_hidden = false：隐藏 SSID 的名字是空的，返回给界面就是一行空白，
+     * 没有意义（而且"空白行"和"字体缺字形"看起来一样，会互相误导）。
+     * block=true = 扫完才返回，所以本函数是阻塞的（2~4 秒）。 */
+    const wifi_scan_config_t scan_cfg = { .show_hidden = false };
     esp_err_t err = esp_wifi_scan_start(&scan_cfg, true);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_wifi_scan_start 失败: %s", esp_err_to_name(err));
@@ -239,16 +276,16 @@ esp_err_t wifi_service_scan(void)
         return ESP_OK;
     }
 
-    uint16_t n = (num > WIFI_SCAN_MAX) ? (uint16_t)WIFI_SCAN_MAX : num;
     /* 用堆而不是栈：一条 record 约 100 字节，32 条就 3KB 多，放栈上太冒险 */
-    wifi_ap_record_t *recs = calloc(n, sizeof(*recs));
+    wifi_ap_record_t *recs = calloc(WIFI_SERVICE_SCAN_MAX, sizeof(*recs));
     if (recs == NULL) {
         ESP_LOGE(TAG, "分配扫描结果缓冲失败");
         esp_wifi_clear_ap_list();
         return ESP_ERR_NO_MEM;
     }
 
-    err = esp_wifi_scan_get_ap_records(&n, recs);
+    uint16_t n = (num > WIFI_SERVICE_SCAN_MAX) ? (uint16_t)WIFI_SERVICE_SCAN_MAX : num;
+    err = esp_wifi_scan_get_ap_records(&n, recs);   /* ⚠️ 可能把 n 改小（实际取到的条数）*/
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_wifi_scan_get_ap_records 失败: %s", esp_err_to_name(err));
         free(recs);
@@ -257,11 +294,42 @@ esp_err_t wifi_service_scan(void)
     }
 
     /* ⚠️ 这张表里**不可能**出现 5GHz 的 AP —— C6 是单频 2.4G 芯片。
-     *    所以"目标 SSID 没出现在下面" = "它不在 2.4GHz 广播"，是物理限制。 */
+     *    所以"目标 SSID 没出现" = "它不在 2.4GHz 广播"，是物理限制。 */
     ESP_LOGI(TAG, "扫描完成：共 %u 个 AP（⚠️ 只能看到 2.4GHz，5G 的一个都看不到）",
              (unsigned)num);
+
+    /* 转成项目自己的结构，同时按信号强度做**插入排序**（从强到弱），
+     * 这样界面拿到就能直接按顺序显示，不用再排。
+     * 数据量最多 32 条，插入排序的 O(n²) 完全无所谓，胜在不用额外缓冲、代码短。 */
+    size_t out_n = 0;
     for (uint16_t i = 0; i < n; i++) {
-        ESP_LOGI(TAG, "  [%2u] ch%-3u %4d dBm  %-16s  \"%s\"",
+        if (recs[i].ssid[0] == '\0' || out_n >= cap) {
+            continue;               /* 空名字（再保险一次）/ 调用方缓冲满了 */
+        }
+
+        size_t pos = out_n;
+        while (pos > 0 && out[pos - 1].rssi < recs[i].rssi) {
+            out[pos] = out[pos - 1];    /* 把更弱的往后挪，给这一条腾位置 */
+            pos--;
+        }
+
+        /* ⚠️ 用 snprintf("%.32s") 而不是 strcpy：ssid 是 uint8_t[33] 的**裸字节**，
+         *    名字正好 32 字节时可能没有结尾符。%.32s 最多读 32 字节，既不会越界
+         *    也会补上结尾符。 */
+        snprintf(out[pos].ssid, sizeof(out[pos].ssid), "%.32s", (const char *)recs[i].ssid);
+        out[pos].rssi    = recs[i].rssi;
+        out[pos].channel = recs[i].primary;
+        /* OWE 是"加密但不需要密码"，所以不能算 secure —— 否则界面会白问一次密码，
+         * 而用户在密码页留空后推出的是 OPEN，反而连不上 OWE 的 AP。 */
+        out[pos].secure  = (recs[i].authmode != WIFI_AUTH_OPEN &&
+                            recs[i].authmode != WIFI_AUTH_OWE);
+        out_n++;
+    }
+
+    /* 明细降到 DEBUG：界面已经有列表了，INFO 级别再刷屏只是噪音。
+     * 想排查时把 wifi 这个 tag 的日志级别调到 DEBUG 即可。 */
+    for (uint16_t i = 0; i < n; i++) {
+        ESP_LOGD(TAG, "  [%2u] ch%-3u %4d dBm  %-16s  \"%s\"",
                  (unsigned)i,
                  (unsigned)recs[i].primary,
                  (int)recs[i].rssi,
@@ -271,7 +339,29 @@ esp_err_t wifi_service_scan(void)
 
     free(recs);
     esp_wifi_clear_ap_list();
+    *count = out_n;
     return ESP_OK;
+}
+
+esp_err_t wifi_service_set_credentials(const char *ssid, const char *password)
+{
+    if (!s_inited) {
+        ESP_LOGE(TAG, "还没 init，不能设凭据");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (ssid == NULL || ssid[0] == '\0') {
+        ESP_LOGE(TAG, "SSID 不能为空");
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (password == NULL) {
+        password = "";              /* 调用方传 NULL 也表示开放网络 */
+    }
+
+    const esp_err_t err = apply_config(ssid, password);
+    if (err == ESP_OK) {
+        s_has_creds = true;
+    }
+    return err;
 }
 
 esp_err_t wifi_service_connect(void)
@@ -280,17 +370,30 @@ esp_err_t wifi_service_connect(void)
         ESP_LOGE(TAG, "还没 init，不能连接");
         return ESP_ERR_INVALID_STATE;
     }
+    if (!s_has_creds) {
+        /* 刻意不去赌驱动 flash 里残留的旧配置（可能还留着上一次写进去的 SSID）——
+         * 那样"能不能连上"取决于上次烧过什么，是最难查的一类问题。 */
+        ESP_LOGW(TAG, "跳过连接：还没有凭据（先调 wifi_service_set_credentials()）");
+        return ESP_ERR_INVALID_STATE;
+    }
 
-    /* 手动连接 = 重试预算重置。此刻下面还没真正连上，但这一行必须留在"连接入口"上：
-     * 等凭据接通后，若漏了它，一次失败到达上限就再也不会自动重连了。 */
+    /* 手动连接 = 重试预算重置 + 断开原因清零。
+     * 后者是为了让界面读到的一定是**本次尝试**的原因，而不是上一次的残留。 */
     s_retry = 0;
+    s_last_disc_reason = 0;
 
-    /* 空壳阶段：没有凭据可连。
-     * 刻意**不**调 esp_wifi_connect() 去赌驱动里残留的旧配置（flash 里可能还留着
-     * 上一次写进去的 SSID）—— 那样"能不能连上"取决于上次烧过什么，是最难查的一类
-     * 问题。等设置 App 把凭据接进来，再放开这里。 */
-    ESP_LOGW(TAG, "跳过连接：本组件目前不带凭据（等设置 App 输入）");
-    return ESP_ERR_INVALID_STATE;
+    const esp_err_t err = esp_wifi_connect();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_connect 失败: %s", esp_err_to_name(err));
+        return err;
+    }
+    ESP_LOGI(TAG, "开始连接（断开会自动重试，上限 %d 次）", WIFI_MAX_RETRY);
+    return ESP_OK;
+}
+
+uint8_t wifi_service_last_disconnect_reason(void)
+{
+    return s_last_disc_reason;
 }
 
 bool wifi_service_is_connected(void)
