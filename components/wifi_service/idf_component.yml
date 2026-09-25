@@ -1,0 +1,14 @@
+## IDF Component Manager Manifest File
+## WiFi 能力依赖：板载 ESP32-C6 当协处理器，ESP32-P4 通过 SDIO 与它通信
+##
+## esp_wifi_remote：提供**标准 esp_wifi.h 头文件 + 弱符号空实现**。
+##                  P4 没有射频，IDF 里根本不会构建原生 esp_wifi 组件，
+##                  所以 esp_wifi.h 只有这个组件才有 —— 没有它连头文件都找不到。
+## esp_hosted：     提供上面那些 API 的**真实实现**（protobuf RPC over SDIO 到 C6）。
+##
+## ⚠️ 版本必须和 C6 里已烧的 slave 固件配套 —— host 端和 slave 端是两半，
+##    版本差太多会握手失败。这里跟厂家示例（05_wifistation / 11_brookesia）保持一致。
+dependencies:
+  idf: ">=5.3"
+  espressif/esp_wifi_remote: "0.14.*"
+  espressif/esp_hosted: "1.4.*"

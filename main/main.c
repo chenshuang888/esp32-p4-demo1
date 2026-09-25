@@ -23,6 +23,7 @@
 #include "time_service.h"
 #include "kv_store.h"
 #include "sd_card.h"
+#include "wifi_service.h"
 
 static const char *TAG = "app";
 
@@ -73,7 +74,7 @@ void app_main(void)
         ESP_LOGW(TAG, "触摸初始化失败，仅运行显示");
     }
 
-    /* ---- 2. 能力层：存储 + 时间 ---- */
+    /* ---- 2. 能力层：存储 + 网络 + 时间 ---- */
 
     /* 存储要先于任何 App 读写之前建好（各 App 的 enter 里就会用到） */
     ESP_ERROR_CHECK(kv_init());
@@ -82,6 +83,24 @@ void app_main(void)
      * 插不插卡不该决定能不能开机。卡不在时由 App 侧自行降级。 */
     if (sd_card_init() != ESP_OK) {
         ESP_LOGW(TAG, "SD 卡未挂载，文件功能不可用");
+    }
+
+    /* WiFi：由板载 ESP32-C6 协处理器提供（P4 通过 SDIO 与它通信）。
+     * 同样**非阻塞 + 失败不 panic** —— 网络是外设，不该决定能不能开机。
+     * 连上与否看 wifi_service 打的日志（"拿到 IP: ..."）。
+     * ⚠️ 必须在 kv_init() 之后：esp_wifi 要用 NVS 存配置。
+     * 放在 camera_init 之前，是为了不被相机那 5s 的等待拖住（见下）。
+     *
+     * ⚠️ **现在连不上是预期的**：wifi_service 目前不带凭据（空壳阶段），
+     *    connect() 会拒绝并打一条日志。保留这个调用是为了让编排形状一次到位 ——
+     *    等设置 App 做好，在它前面把凭据从 kv_store 读出来喂给 wifi_service，
+     *    这条链路就通了。 */
+    if (wifi_service_init() != ESP_OK) {
+        ESP_LOGW(TAG, "WiFi 未启动，网络功能不可用");
+    } else {
+        /* 只发起连接，**不在这里等 IP** —— 等待会拖住开机（UI 还没建起来）。
+         * 想"先扫描看清楚再连"，调 wifi_service_scan()（阻塞 2~4 秒）。 */
+        wifi_service_connect();
     }
 
     /* ---- 相机链路：USB Host + UVC 驱动 + 拍照保存任务 ----

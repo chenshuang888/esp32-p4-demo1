@@ -58,3 +58,44 @@ CONFIG_LV_FONT_DEFAULT_MONTSERRAT_18=y
 # 取值来自 demo1 的 USB 摄像头工程（同一块板实测可用）。
 CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=4096
 CONFIG_USB_HOST_HW_BUFFER_BIAS_IN=y
+
+# ---- WiFi（板载 ESP32-C6 协处理器，P4 <-> C6 走 SDIO）----
+#
+# 取值出处：厂家 brookesia 手机示例的**生成版** sdkconfig
+#   esp32p4_research/ESP32-P4-WIFI6-Touch-LCD-7B/examples/ESP-IDF/11_esp_brookesia_phone/sdkconfig:2634-2667 (hosted)
+#                                                                    :2773-2800 (wifi_remote)
+# 那份 sdkconfig 里同一组配置出现了两次，**前缀不同**：
+#   带 ESP_HOSTED_ 前缀的 = 正式符号名（"ESP-Hosted config" 段）
+#   不带的（CONFIG_SDIO_*、CONFIG_IDF_SLAVE_TARGET） = 旧名，在 "# End of deprecated options" 段里，不要用
+#
+# ⚠️ 厂家**没有任何示例**在 sdkconfig.defaults 里写这些 —— 说明 esp_hosted 对
+#    ESP32-P4 的默认值本来就是这套接线（和 Espressif P4-Function-EV-Board 一致）。
+#    这里显式写出来的目的，是让板级接线在仓库里可见，而不是藏在第三方组件的 Kconfig 默认值里。
+#    （万一某个名字写错了，kconfig 会静默忽略该行 -> 退回默认值，不会比不写更差。）
+#
+# ⚠️ 首次编译后请核对一次（这条链路是"配置错了不报错、只是连不上"的类型）：
+#      grep -E "ESP_HOSTED_SDIO_PIN_CLK|ESP_WIFI_REMOTE_ENABLED|SLAVE_IDF_TARGET" sdkconfig
+#    期望看到 PIN_CLK=18、REMOTE_ENABLED=y、SLAVE_IDF_TARGET_ESP32C6=y。
+#    若没生效：删掉 sdkconfig 重新生成（defaults 只对 sdkconfig 里**尚未出现**的符号生效）。
+
+# --- esp_wifi_remote 总开关：不写这三项，组件装了也不生效 ---
+CONFIG_ESP_WIFI_REMOTE_ENABLED=y
+CONFIG_SLAVE_IDF_TARGET_ESP32C6=y
+CONFIG_ESP_WIFI_REMOTE_LIBRARY_HOSTED=y
+
+# --- esp_hosted 传输方式：SDIO（P4 的 SDMMC slot 1，走 GPIO 矩阵）---
+CONFIG_ESP_HOSTED_SDIO_HOST_INTERFACE=y
+CONFIG_ESP_HOSTED_IDF_SLAVE_TARGET="esp32c6"
+CONFIG_ESP_HOSTED_SDIO_4_BIT_BUS=y
+CONFIG_ESP_HOSTED_SDIO_CLOCK_FREQ_KHZ=40000
+CONFIG_ESP_HOSTED_SDIO_OPTIMIZATION_RX_STREAMING_MODE=y
+CONFIG_ESP_HOSTED_SDIO_RESET_ACTIVE_HIGH=y
+
+# --- 接线（注意和 uSD 卡完全不重叠：卡在 slot0 的 IOMUX 39~44 + LDO4）---
+CONFIG_ESP_HOSTED_SDIO_PIN_CLK=18
+CONFIG_ESP_HOSTED_SDIO_PIN_CMD=19
+CONFIG_ESP_HOSTED_SDIO_PIN_D0=14
+CONFIG_ESP_HOSTED_SDIO_PIN_D1=15
+CONFIG_ESP_HOSTED_SDIO_PIN_D2=16
+CONFIG_ESP_HOSTED_SDIO_PIN_D3=17
+CONFIG_ESP_HOSTED_SDIO_GPIO_RESET_SLAVE=54
