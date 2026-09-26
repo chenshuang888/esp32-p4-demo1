@@ -31,6 +31,7 @@
 #include "app_manager.h"
 #include "kv_store.h"
 #include "lcd_screen_display.h"
+#include "picture.h"
 #include "ui_status_bar.h"
 #include "wifi_service.h"
 
@@ -463,9 +464,7 @@ static void settings_leave(void)
 
 static const app_desc_t s_desc = {
     .name  = "Settings",
-    /* 暂时没有图标资源：picture_icon() 查不到会返回 NULL，桌面就只显示名字
-     * （加图标的流程见 README 的"图像资源"一节）。 */
-    .icon  = "",
+    .icon  = PICTURE_ICON_SETTINGS,
     .enter = settings_enter,
     .leave = settings_leave,
 };

@@ -37,10 +37,11 @@ const lv_image_dsc_t *picture_wallpaper(void);
  * 注意这些常量只是"不透明标识符"：app_manager 只负责原样保管那个字符串，
  * 不解释它，也不知道它对应一张图。翻译成图片是 picture_icon() 的事。
  */
-#define PICTURE_ICON_CLOCK  "clock"
-#define PICTURE_ICON_DEMO   "demo"
-#define PICTURE_ICON_CAMERA "camera"
-#define PICTURE_ICON_PHOTO  "photo"
+#define PICTURE_ICON_CLOCK    "clock"
+#define PICTURE_ICON_DEMO     "demo"
+#define PICTURE_ICON_CAMERA   "camera"
+#define PICTURE_ICON_PHOTO    "photo"
+#define PICTURE_ICON_SETTINGS "settings"
 
 /**
  * @brief 按 id 取图标（96x96，RGB565A8，带透明）

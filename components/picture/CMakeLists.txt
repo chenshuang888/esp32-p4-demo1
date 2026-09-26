@@ -13,6 +13,7 @@ idf_component_register(
         "images/picture_icon_demo_data.c"
         "images/picture_icon_camera_data.c"
         "images/picture_icon_photo_data.c"
+        "images/picture_icon_settings_data.c"
     INCLUDE_DIRS
         "include"
 )

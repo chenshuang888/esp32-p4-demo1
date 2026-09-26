@@ -36,6 +36,7 @@
  *       C:\Users\ChenShuang\Desktop\esp32-p4\原始图片\demo.webp    (800x800)
  *       C:\Users\ChenShuang\Desktop\esp32-p4\原始图片\camera.png   (410x410, 已手工裁掉水印和多余底色)
  *       C:\Users\ChenShuang\Desktop\esp32-p4\原始图片\photo.webp   (282x282)
+ *       C:\Users\ChenShuang\Desktop\esp32-p4\原始图片\setting.jpg  (1024x993, 灰底+水印，需先转 settings.png，见下)
  *
  * 先经过一步"规范尺寸"处理（裁到内容边界 + 把外圈抠成透明）：
  *   cd 原始图片 && python make_icons_square.py
@@ -55,11 +56,19 @@
  *      之前那张 camera.jpg 就是反例：底部一条"昵享网 ..."水印带比图标还暗，
  *      实测 bbox 被拉到 x 15~1014，水印和灰底会一起进图标。
  *
+ *   ⚠️ setting.jpg 比 camera.jpg 还麻烦：它**底色是深灰(104,104,104)而不是白**，
+ *      直接喂进来会因 min(R,G,B)=104 < 180 把整张灰底都算成内容。所以先用
+ *      **饱和度**预处理成 settings.png 再喂给本脚本（灰底与黑白水印饱和度为 0，
+ *      天然被排除）：① 取 max(R,G,B)-min(R,G,B) > 40 的区域外接矩形 —— 框出青绿
+ *      图标、顺带把框外的水印裁掉；② 裁成正方形，把四角连通的深灰底洪水填充成白。
+ *      这么处理后本脚本会报"裁 100%"（和 camera 一样，源图已经是图标边界）。
+ *
  * 再转成 LVGL 格式（源图带 alpha，所以必须用 RGB565A8 才存得下"透明"）：
  *   python managed_components/lvgl__lvgl/scripts/LVGLImage.py --cf RGB565A8 --ofmt C --name picture_icon_clock_data -o components/picture/images <icons_square/clock.png>
  *   python managed_components/lvgl__lvgl/scripts/LVGLImage.py --cf RGB565A8 --ofmt C --name picture_icon_demo_data  -o components/picture/images <icons_square/demo.png>
  *   python managed_components/lvgl__lvgl/scripts/LVGLImage.py --cf RGB565A8 --ofmt C --name picture_icon_camera_data -o components/picture/images <icons_square/camera.png>
  *   python managed_components/lvgl__lvgl/scripts/LVGLImage.py --cf RGB565A8 --ofmt C --name picture_icon_photo_data  -o components/picture/images <icons_square/photo.png>
+ *   python managed_components/lvgl__lvgl/scripts/LVGLImage.py --cf RGB565A8 --ofmt C --name picture_icon_settings_data -o components/picture/images <icons_square/settings.png>
  *   96x96 RGB565A8 = 96*96*3 = 27648 字节/个（2 字节颜色 + 1 字节 alpha）。
  *
  * ==========================================================
@@ -90,6 +99,7 @@ extern const lv_image_dsc_t picture_icon_clock_data;
 extern const lv_image_dsc_t picture_icon_demo_data;
 extern const lv_image_dsc_t picture_icon_camera_data;
 extern const lv_image_dsc_t picture_icon_photo_data;
+extern const lv_image_dsc_t picture_icon_settings_data;
 
 /*
  * id -> 图标的对照表。
@@ -101,10 +111,11 @@ static const struct {
     const char           *id;
     const lv_image_dsc_t *dsc;
 } S_ICONS[] = {
-    { PICTURE_ICON_CLOCK,  &picture_icon_clock_data  },
-    { PICTURE_ICON_DEMO,   &picture_icon_demo_data   },
-    { PICTURE_ICON_CAMERA, &picture_icon_camera_data },
-    { PICTURE_ICON_PHOTO,  &picture_icon_photo_data  },
+    { PICTURE_ICON_CLOCK,    &picture_icon_clock_data    },
+    { PICTURE_ICON_DEMO,     &picture_icon_demo_data     },
+    { PICTURE_ICON_CAMERA,   &picture_icon_camera_data   },
+    { PICTURE_ICON_PHOTO,    &picture_icon_photo_data    },
+    { PICTURE_ICON_SETTINGS, &picture_icon_settings_data },
 };
 
 const lv_image_dsc_t *picture_icon(const char *id)
