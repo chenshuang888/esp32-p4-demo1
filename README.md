@@ -45,7 +45,9 @@ components/
   picture/           图片资源：壁纸与图标（数据由脚本生成）
   kv_store/          能力：键值存储（NVS 后端）
   time_service/      能力：时间（对时 + 时区，不认识任何时间源）
-  wifi_service/      能力：WiFi（板载 C6 走 SDIO；**不认识 NVS**，凭据由调用方喂进来）
+  net_time/          能力：SNTP 对时（网络时间源；不认识 wifi，也不认识 time_service）
+  wifi_service/      能力：WiFi（板载 C6 走 SDIO；**不认识 NVS**，凭据由调用方喂进来；
+                     提供"拿到 IP 就通知"的回调，供 net_time 这类订阅者挂接）
   sd_card/           能力：SD 卡挂载（之后用 POSIX 文件 API）
   frame_buf/         能力：双缓冲原语（丢旧保新 + 读槽占用保护）
   jpeg_decoder/      能力：JPEG → RGB565（**同步一次性**；输入是裸指针，不认识 frame_buf）
@@ -126,6 +128,7 @@ components/
 | 相册解码：上一次的读槽要"下次解码前"才还，早了会画到已释放内存 | `apps/photo.c` 的 `photo_show` |
 | USB Host 两项配置是 UVC 能枚举的前提（不是调优项） | `sdkconfig.defaults` |
 | SD 卡那条 LDO "voltage 0 out of range" 警告可忽略且无法消除 | `components/sd_card/sd_card.c` |
+| SNTP 必须在**拿到 IP 之后**才启动：lwip 自己的重试退避是 15s→逐次加倍→上限 150s，早启动会让首次对时白等很久。本项目把它挂在 `wifi_service` 的"拿到 IP"回调上 | `components/net_time/net_time.h`、`main/main.c` 的 WiFi 块 |
 | 图标源图不能带水印，否则内容边界会变成整张图 | `components/picture/picture.c` 顶部 |
 | 进 WiFi 列表时**扫描是同步阻塞的**（2~4 秒，界面冻住）；`lv_refr_now()` 是为了让 "Scanning..." 能显示出来，不然连提示都看不到 | `apps/settings.c` 的 `wifi_start_scan` |
 | 中文 SSID 会显示成**一串占位方块**（项目没有中文字体）。不是空白 —— `LV_USE_FONT_PLACEHOLDER` 默认开会画方块 | `components/wifi_service/wifi_service.h` 的 `wifi_service_ap_t` |
@@ -134,7 +137,7 @@ components/
 
 demo1 有的、这里已覆盖：桌面、app_manager、相机（+ 拍照存卡）、相册、屏幕/触摸、SD 卡。
 
-这里多出来的：`kv_store`、`time_service`、`wifi_service`、全局状态栏、`picture` 图片资源组件、
+这里多出来的：`kv_store`、`time_service`、`net_time`（SNTP 对时）、`wifi_service`、全局状态栏、`picture` 图片资源组件、
 Camera 的**录像能力**（`avi_writer` + 常驻录像任务）与相册的**视频播放**（`avi_reader`
 + 同步播放定时器）、Clock / Demo / Settings 三个 App，
 以及**每个 App 的 enter/leave 生命周期与资源回收纪律**

@@ -25,6 +25,7 @@
 #include "kv_store.h"
 #include "sd_card.h"
 #include "wifi_service.h"
+#include "net_time.h"
 
 static const char *TAG = "app";
 
@@ -65,6 +66,33 @@ static void status_bar_back(void)
     app_manager_go_home();
 }
 
+/*
+ * ===================== 时间源的"胶水"函数 =====================
+ *
+ * net_time 从网络拿到的是 UTC 秒（int64_t），要交给 time_service_set() 存下来。
+ * 两边签名不兼容：net_time 的回调是 void(*)(int64_t)，而 time_service_set 返回
+ * esp_err_t —— 和上面 status_bar_back 是同一类问题（经不兼容的函数指针调用是
+ * 未定义行为，C11 6.3.2.3 第 8 段），所以同样包一层把返回值丢掉。
+ *
+ * ⚠️ 它最终跑在 lwip/SNTP 任务上下文里，所以里面不要再加 LVGL 锁。
+ */
+static void net_time_synced(int64_t utc_sec)
+{
+    time_service_set(utc_sec);
+}
+
+/*
+ * 反过来这一头："网络上线了" -> 启动对时。
+ *
+ * 同样必须包一层：net_time_start() 的类型是 esp_err_t(*)(void)，而
+ * wifi_service_connected_cb_t 是 void(*)(void) —— 两个都要包，理由同上，
+ * 不要图省事把函数名直接传过去。
+ */
+static void on_wifi_connected(void)
+{
+    net_time_start();
+}
+
 void app_main(void)
 {
     /* ---- 1. 硬件层：点亮屏 + 起触摸 ---- */
@@ -94,6 +122,17 @@ void app_main(void)
     if (wifi_service_init() != ESP_OK) {
         ESP_LOGW(TAG, "WiFi 未启动，网络功能不可用");
     } else {
+        /* ---- 时间源：配置 SNTP，并挂在"拿到 IP"钩子上 ----
+         * ⚠️ 顺序不能反：**先 net_time_init() 把服务器配好，再注册钩子**。
+         *    因为下面 camera_init() 还要阻塞约 5s，IP 完全可能在这段窗口内就到；
+         *    若那时才配服务器名，SNTP 会先拿默认服务器发一次请求。
+         *
+         * net_time 与 wifi_service **互不认识** —— 这里由 main 把两者接起来，
+         * 和上面状态栏注入 clock_text / back 是同一种做法：
+         * 谁同时认识两边，谁负责组装。 */
+        net_time_init(net_time_synced);
+        wifi_service_set_on_connected(on_wifi_connected);
+
         /* 凭据由 main 从 kv_store 读出来喂进组件 —— wifi_service **不认识 NVS**，
          * 这和 time_service_set() 是同一个模式：谁组装谁负责把外部输入接进来。
          * 键名常量（WIFI_CFG_*）定义在 wifi_service.h，和设置 App 写入时用的是同一份。
@@ -132,11 +171,13 @@ void app_main(void)
 
     time_service_init();
 
-    /* 对时：由 main 负责把"外部时间源"接进来（组件本身不认识任何时间源）
+    /* 对时：时间源是 SNTP（net_time 组件）。它已经在上面 WiFi 块里配置好，
+     * 并挂在"拿到 IP"钩子上 —— 连上网络的那一刻就会把时间喂进来。
+     * 所以这里不需要再做任何事（原来那行硬编码的假时间已删掉）。
      *
-     * ⚠️ 现在是硬编码一个固定时间用于验证链路（约 2026-01，UTC 秒）。
-     *    以后接 SNTP / RTC 芯片时，只改这一处 —— time_service 和 App 都不用动。 */
-    time_service_set(1768000000);
+     * 对时成功前 time_service_get() 返回 ESP_ERR_INVALID_STATE：
+     * Clock 显示 "--:--:--"、状态栏的时间留空。这是**设计预期**
+     * （宁可空着，也不显示一个假时间），没配过 WiFi 时就是这个状态。 */
 
     /* ---- 3. 注册 App ----
      * 顺序就是"已装 App 清单"。第 0 个是主页，所以桌面必须第一个。 */

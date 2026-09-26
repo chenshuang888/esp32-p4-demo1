@@ -1,7 +1,8 @@
 /*
  * wifi_service —— WiFi 能力组件（由板载 ESP32-C6 提供）
  *
- * 它做四件事：**把 WiFi 起起来**、**扫一遍周边 AP**、**接收凭据**、**按凭据连接**。
+ * 它做五件事：**把 WiFi 起起来**、**扫一遍周边 AP**、**接收凭据**、**按凭据连接**、
+ * **在拿到 IP 时通知订阅者**。
  *
  * ⚠️ 本组件**不自带任何凭据**，也**不认识 NVS**。凭据由调用方喂进来：
  *    设置 App 写 kv_store → main 在开机时读出来调 wifi_service_set_credentials()
@@ -147,6 +148,30 @@ esp_err_t wifi_service_scan(wifi_service_ap_t *out, size_t cap, size_t *count);
  *         其余                 esp_wifi_connect() 返回的错误
  */
 esp_err_t wifi_service_connect(void);
+
+/* ===================== 连接事件通知 ===================== */
+
+/**
+ * @brief "拿到 IP"时的回调
+ *
+ * ⚠️ 跑在**默认事件循环任务**上下文，不是 LVGL 任务 —— 里面**不要碰 lv_xxx**。
+ *
+ * ⚠️ **每次**拿到 IP 都会回调：开机的首次连接、扫描打断后的自动重连、
+ *    以及以后在设置 App 里换网重连。所以回调实现必须**幂等**。
+ *
+ * 存在的意义：让"网络一来就做某事"不必轮询。本项目的第一个使用者是
+ * net_time —— main 把它接到 net_time_start()，连上即对时；此后任何
+ * 需要"等网络"的能力都可以复用这条钩子。
+ */
+typedef void (*wifi_service_connected_cb_t)(void);
+
+/**
+ * @brief 注册上面的回调；传 NULL 取消注册
+ *
+ * 覆盖式（重复调用以最后一次为准）。可在 wifi_service_init() 前后调用，
+ * 但要赶在 wifi_service_connect() 之前 —— 否则可能漏掉第一次拿到 IP 的事件。
+ */
+void wifi_service_set_on_connected(wifi_service_connected_cb_t cb);
 
 /**
  * @brief 现在拿到 IP 了吗

@@ -58,6 +58,10 @@ static const char *TAG = "wifi";
 static EventGroupHandle_t s_events;         /* NULL = init 没成功过 */
 #define WIFI_CONNECTED_BIT  BIT0            /* 已拿到 IP */
 
+/* "拿到 IP"的通知回调。由调用方注册（见 wifi_service_set_on_connected），
+ * 在事件回调里调用 —— 所以它跑在**默认事件循环任务**里。 */
+static wifi_service_connected_cb_t s_on_connected = NULL;
+
 static int  s_retry  = 0;
 static bool s_inited = false;
 static esp_netif_t *s_netif = NULL;         /* init 时建好的 STA netif，wifi_service_get_ip() 要用 */
@@ -159,6 +163,13 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         xEventGroupSetBits(s_events, WIFI_CONNECTED_BIT);
         /* 这一行 = 链路验证成功的最终标志 */
         ESP_LOGI(TAG, "拿到 IP: " IPSTR, IP2STR(&ev->ip_info.ip));
+
+        /* 通知订阅者（本项目是 net_time：连上即对时）。
+         * ⚠️ 这里跑在事件循环任务里，回调不能碰 LVGL；而且每次拿到 IP 都会回调
+         *    （含重连），所以回调必须是幂等的 —— 见 wifi_service.h 的说明。 */
+        if (s_on_connected != NULL) {
+            s_on_connected();
+        }
     }
 }
 
@@ -394,6 +405,11 @@ esp_err_t wifi_service_connect(void)
 uint8_t wifi_service_last_disconnect_reason(void)
 {
     return s_last_disc_reason;
+}
+
+void wifi_service_set_on_connected(wifi_service_connected_cb_t cb)
+{
+    s_on_connected = cb;
 }
 
 bool wifi_service_is_connected(void)
