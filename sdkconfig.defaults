@@ -45,6 +45,50 @@ CONFIG_LV_DEF_REFR_PERIOD=15
 # 18 号字体由这个 choice 自动 select 进来（Kconfig 里的 select LV_FONT_MONTSERRAT_18）。
 CONFIG_LV_FONT_DEFAULT_MONTSERRAT_18=y
 
+# ---- 全量字体档位 8~48（一次开满，以后写 UI 想用哪档用哪档）----
+# 决策：把 LVGL 预置的 Montserrat 档位全部打开，从此不必"用一种开一种"。
+#       需要某档时直接在代码里 lv_obj_set_style_text_font() 即可。
+#
+# 为什么选"开满位图档位"而不是"运行时 TTF (LV_USE_TINY_TTF)"：
+#   - 位图档位是纯 rodata：**零运行期 RAM、零 CPU 开销、零新机制**。
+#   - tiny_ttf 要引入字体对象的创建/缓存/销毁，以及每档一份字形缓存
+#     （48px 默认缓存约 100~130 KB 内部 RAM），运行期复杂度更高。
+#   - 实测全梯 rodata ≈ 846 KB；app 分区 8 MB、当前固件 2.74 MB，余量充足。
+#     （对照：tiny_ttf = 代码 21.6 KB + Montserrat TTF 238 KB ≈ 259 KB，
+#       换来"任意字号"；本方案只到 48。约 6 档以内位图更省，此处选确定性。）
+#
+# ⚠️ 上限：LVGL 预置的 Montserrat 最大就是 48，没有 64/72/96。
+#    将来真要 >48px，三条路：
+#      ① transform_scale 放大 48（位图拉伸，发虚/锯齿）；
+#      ② 用 managed_components/lvgl__lvgl/scripts/built_in_font 的 lv_font_conv
+#         离线生成某个大号的 .c 提交（仍属本方案，清晰、零运行期成本）；
+#      ③ 上 tiny_ttf。
+#
+# ⚠️ 生效方式：defaults 只对 sdkconfig 里"尚未出现"的符号生效。这些档位在
+#    现有 sdkconfig 里已是 "# ... is not set"，故改完必须删掉 sdkconfig 重新生成
+#    （sdkconfig 未纳入 git，可安全删除）。
+CONFIG_LV_FONT_MONTSERRAT_8=y
+CONFIG_LV_FONT_MONTSERRAT_10=y
+CONFIG_LV_FONT_MONTSERRAT_12=y
+CONFIG_LV_FONT_MONTSERRAT_14=y
+CONFIG_LV_FONT_MONTSERRAT_16=y
+CONFIG_LV_FONT_MONTSERRAT_18=y
+CONFIG_LV_FONT_MONTSERRAT_20=y
+CONFIG_LV_FONT_MONTSERRAT_22=y
+CONFIG_LV_FONT_MONTSERRAT_24=y
+CONFIG_LV_FONT_MONTSERRAT_26=y
+CONFIG_LV_FONT_MONTSERRAT_28=y
+CONFIG_LV_FONT_MONTSERRAT_30=y
+CONFIG_LV_FONT_MONTSERRAT_32=y
+CONFIG_LV_FONT_MONTSERRAT_34=y
+CONFIG_LV_FONT_MONTSERRAT_36=y
+CONFIG_LV_FONT_MONTSERRAT_38=y
+CONFIG_LV_FONT_MONTSERRAT_40=y
+CONFIG_LV_FONT_MONTSERRAT_42=y
+CONFIG_LV_FONT_MONTSERRAT_44=y
+CONFIG_LV_FONT_MONTSERRAT_46=y
+CONFIG_LV_FONT_MONTSERRAT_48=y
+
 # ---- USB Host（USB 摄像头 / UVC 需要）----
 # 这两项是 UVC 能不能工作的**前提**，不是调优项：
 #

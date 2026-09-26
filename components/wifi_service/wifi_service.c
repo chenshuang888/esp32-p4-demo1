@@ -33,6 +33,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/task.h"      /* vTaskDelay：换网时要等"断开"事件走完 */
 
 #include "esp_event.h"
 #include "esp_log.h"
@@ -51,10 +52,6 @@ static const char *TAG = "wifi";
  * WIFI_CFG_* 那一份常量约定，写入方和读出方不会各写各的。
  */
 
-/* 连不上时重试几次就放弃。只为压制日志噪音 —— 放弃后**不重启也不阻塞谁**，
- * 只是不再自动重连（想再来一次就重启板子）。 */
-#define WIFI_MAX_RETRY  5
-
 static EventGroupHandle_t s_events;         /* NULL = init 没成功过 */
 #define WIFI_CONNECTED_BIT  BIT0            /* 已拿到 IP */
 
@@ -62,7 +59,6 @@ static EventGroupHandle_t s_events;         /* NULL = init 没成功过 */
  * 在事件回调里调用 —— 所以它跑在**默认事件循环任务**里。 */
 static wifi_service_connected_cb_t s_on_connected = NULL;
 
-static int  s_retry  = 0;
 static bool s_inited = false;
 static esp_netif_t *s_netif = NULL;         /* init 时建好的 STA netif，wifi_service_get_ip() 要用 */
 
@@ -145,21 +141,20 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         xEventGroupClearBits(s_events, WIFI_CONNECTED_BIT);
         s_last_disc_reason = (uint8_t)ev->reason;
         /* reason 是排查的关键：201 = NO_AP_FOUND（多半是压根没扫到，比如目标只在 5G），
-         * 15 = 4WAY_HANDSHAKE_TIMEOUT（多半是密码错），202 = AUTH_FAIL。
-         * 同一个值也会被设置 App 读走，翻译成人话显示在界面上。 */
-        if (s_retry < WIFI_MAX_RETRY) {
-            s_retry++;
-            ESP_LOGW(TAG, "连接断开 (reason=%d)，重试 %d/%d",
-                     (int)ev->reason, s_retry, WIFI_MAX_RETRY);
-            esp_wifi_connect();
-        } else {
-            ESP_LOGE(TAG, "重试 %d 次仍连不上 (reason=%d)，放弃（不再自动重连）",
-                     WIFI_MAX_RETRY, (int)ev->reason);
-        }
+         * 15 = 4WAY_HANDSHAKE_TIMEOUT（多半是密码错），202 = AUTH_FAIL，
+         * 8 = ASSOC_LEAVE（我们自己调 esp_wifi_disconnect() 主动断开的，不是故障）。
+         * 同一个值也会被设置 App 读走，翻译成人话显示在界面上。
+         *
+         * ⚠️ **本组件刻意不做自动重连**（原来那套"重试 N 次再放弃"已删掉）：
+         *    连不上就停在"连不上"，由调用方/用户决定要不要再来一次。
+         *    换来的是行为可预测、日志不刷屏；而且"主动断开换网"和"真掉线"不再需要
+         *    互相区分 —— 两者都只是记个 reason，没有人会偷偷重连。
+         *    唯一会主动再连的地方是 wifi_service_connect()（调用方显式要求连上），
+         *    见那里的说明。 */
+        ESP_LOGW(TAG, "连接断开 (reason=%d)", (int)ev->reason);
 
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         const ip_event_got_ip_t *ev = (const ip_event_got_ip_t *)data;
-        s_retry = 0;
         xEventGroupSetBits(s_events, WIFI_CONNECTED_BIT);
         /* 这一行 = 链路验证成功的最终标志 */
         ESP_LOGI(TAG, "拿到 IP: " IPSTR, IP2STR(&ev->ip_info.ip));
@@ -388,17 +383,41 @@ esp_err_t wifi_service_connect(void)
         return ESP_ERR_INVALID_STATE;
     }
 
-    /* 手动连接 = 重试预算重置 + 断开原因清零。
-     * 后者是为了让界面读到的一定是**本次尝试**的原因，而不是上一次的残留。 */
-    s_retry = 0;
+    /* 断开原因清零：让界面读到的一定是**本次尝试**的原因，而不是上一次的残留。 */
     s_last_disc_reason = 0;
+
+    /* ⚠️ IDF 的约定（esp_wifi.h:439，attention 2）：**已经连着 AP 时
+     *    esp_wifi_connect() 不会切到新配置的 AP** —— 必须先 disconnect。
+     *    少了这一步，"换网"会静默失败：connect() 返回 OK，但站还在旧 AP 上
+     *    （实测：连着校园网去选自己的热点 —— 一个断开事件都没有，请求照样跑在校园网上）。
+     *
+     * 断开是**异步**的，所以这里要等它真的完成再 connect（否则驱动的状态机会把
+     * connect 拒掉）。等的是我们自己的 WIFI_CONNECTED_BIT —— 它在
+     * WIFI_EVENT_STA_DISCONNECTED 里被清掉，所以这个循环同时也就等到了那个事件。
+     * 只有"切网"这条路会等；首次连接（本来就没连）一步都不多花。 */
+    if (wifi_service_is_connected()) {
+        ESP_LOGI(TAG, "当前已连着 AP，先断开再连新目标（换网）");
+        esp_wifi_disconnect();
+
+        for (int i = 0; i < 20 && wifi_service_is_connected(); i++) {   /* 上限约 200ms */
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        if (wifi_service_is_connected()) {
+            ESP_LOGE(TAG, "等了 200ms 还没断开，本次换网放弃");
+            return ESP_FAIL;
+        }
+
+        /* 刚那次断开是我们自己要的，不该当成"失败原因"留给界面 ——
+         * 事件回调已经把它写进 s_last_disc_reason 了（reason 8 = ASSOC_LEAVE），这里清掉。 */
+        s_last_disc_reason = 0;
+    }
 
     const esp_err_t err = esp_wifi_connect();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_wifi_connect 失败: %s", esp_err_to_name(err));
         return err;
     }
-    ESP_LOGI(TAG, "开始连接（断开会自动重试，上限 %d 次）", WIFI_MAX_RETRY);
+    ESP_LOGI(TAG, "开始连接");
     return ESP_OK;
 }
 

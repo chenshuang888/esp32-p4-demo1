@@ -21,11 +21,13 @@
 #include "camera.h"
 #include "photo.h"
 #include "settings.h"
+#include "weather.h"
 #include "time_service.h"
 #include "kv_store.h"
 #include "sd_card.h"
 #include "wifi_service.h"
 #include "net_time.h"
+#include "weather_service.h"
 
 static const char *TAG = "app";
 
@@ -157,6 +159,15 @@ void app_main(void)
         }
     }
 
+    /* 天气能力：起一个**常驻 worker 任务**（8192 栈，比其它任务大一倍）专门做 HTTPS。
+     * 为什么必须在独立任务里：LVGL 任务栈只有 7168B（esp_lvgl_port 的默认值），
+     * 放不下 TLS 握手 + 证书校验 —— 详见 weather_service.h 顶部。
+     * 这里只建任务、**不发请求**：请求由天气 App 的 enter / Refresh 按钮触发。
+     * 失败也不 panic（App 进去会显示 unavailable）。 */
+    if (weather_service_init() != ESP_OK) {
+        ESP_LOGW(TAG, "天气能力未就绪（App 仍会注册，进去只显示不可用）");
+    }
+
     /* ---- 相机链路：USB Host + UVC 驱动 + 拍照保存任务 ----
      * 由 camera App 提供，但属于"能力就位"阶段：必须在注册 App 之前完成。
      * 这里建的两样都**常驻**（进出 App 不重建）：
@@ -187,6 +198,7 @@ void app_main(void)
     camera_register();
     photo_register();
     settings_register();
+    weather_register();
 
     /* ---- 4. UI 层：接入 LVGL ---- */
     ESP_ERROR_CHECK(ui_init());

@@ -11,6 +11,7 @@ idf_component_register(
         "camera.c"
         "photo.c"
         "settings.c"
+        "weather.c"
     INCLUDE_DIRS
         "include"
     REQUIRES
@@ -27,4 +28,5 @@ idf_component_register(
         sd_card
         lcd_screen      # settings.c 直接用 LCD_SCREEN_*_RES 算布局
         wifi_service    # settings.c 扫描 / 设凭据 / 连接
+        weather_service # weather.c 发起天气请求 / 轮询结果
 )

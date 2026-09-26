@@ -37,6 +37,7 @@
  *       C:\Users\ChenShuang\Desktop\esp32-p4\原始图片\camera.png   (410x410, 已手工裁掉水印和多余底色)
  *       C:\Users\ChenShuang\Desktop\esp32-p4\原始图片\photo.webp   (282x282)
  *       C:\Users\ChenShuang\Desktop\esp32-p4\原始图片\setting.jpg  (1024x993, 灰底+水印，需先转 settings.png，见下)
+ *       C:\Users\ChenShuang\Desktop\esp32-p4\原始图片\weather.webp (800x800, 干净：底色是画上去的棋盘格，同 clock.png)
  *
  * 先经过一步"规范尺寸"处理（裁到内容边界 + 把外圈抠成透明）：
  *   cd 原始图片 && python make_icons_square.py
@@ -69,6 +70,7 @@
  *   python managed_components/lvgl__lvgl/scripts/LVGLImage.py --cf RGB565A8 --ofmt C --name picture_icon_camera_data -o components/picture/images <icons_square/camera.png>
  *   python managed_components/lvgl__lvgl/scripts/LVGLImage.py --cf RGB565A8 --ofmt C --name picture_icon_photo_data  -o components/picture/images <icons_square/photo.png>
  *   python managed_components/lvgl__lvgl/scripts/LVGLImage.py --cf RGB565A8 --ofmt C --name picture_icon_settings_data -o components/picture/images <icons_square/settings.png>
+ *   python managed_components/lvgl__lvgl/scripts/LVGLImage.py --cf RGB565A8 --ofmt C --name picture_icon_weather_data  -o components/picture/images <icons_square/weather.png>
  *   96x96 RGB565A8 = 96*96*3 = 27648 字节/个（2 字节颜色 + 1 字节 alpha）。
  *
  * ==========================================================
@@ -100,6 +102,37 @@ extern const lv_image_dsc_t picture_icon_demo_data;
 extern const lv_image_dsc_t picture_icon_camera_data;
 extern const lv_image_dsc_t picture_icon_photo_data;
 extern const lv_image_dsc_t picture_icon_settings_data;
+extern const lv_image_dsc_t picture_icon_weather_data;
+
+/* 天气条件图标（天气 App 用）。12 类 x 2 档尺寸：
+ *   不带 _s 后缀 = 96x96（天气页 hero 大图）；带 _s = 32x32（小时条 / 7 日列表）。
+ * 源图是"中国气象局标准天气图标"的拼图，由 原始图片/make_weather_icons.py
+ * 切片 + 抠 alpha + 重着色成深色后，再经 LVGLImage.py 转成这里的 .c。 */
+extern const lv_image_dsc_t picture_icon_wmo_clear_data;
+extern const lv_image_dsc_t picture_icon_wmo_partly_cloudy_data;
+extern const lv_image_dsc_t picture_icon_wmo_overcast_data;
+extern const lv_image_dsc_t picture_icon_wmo_fog_data;
+extern const lv_image_dsc_t picture_icon_wmo_freezing_data;
+extern const lv_image_dsc_t picture_icon_wmo_light_rain_data;
+extern const lv_image_dsc_t picture_icon_wmo_moderate_rain_data;
+extern const lv_image_dsc_t picture_icon_wmo_heavy_rain_data;
+extern const lv_image_dsc_t picture_icon_wmo_showers_data;
+extern const lv_image_dsc_t picture_icon_wmo_thunder_data;
+extern const lv_image_dsc_t picture_icon_wmo_light_snow_data;
+extern const lv_image_dsc_t picture_icon_wmo_snow_showers_data;
+
+extern const lv_image_dsc_t picture_icon_wmo_clear_s_data;
+extern const lv_image_dsc_t picture_icon_wmo_partly_cloudy_s_data;
+extern const lv_image_dsc_t picture_icon_wmo_overcast_s_data;
+extern const lv_image_dsc_t picture_icon_wmo_fog_s_data;
+extern const lv_image_dsc_t picture_icon_wmo_freezing_s_data;
+extern const lv_image_dsc_t picture_icon_wmo_light_rain_s_data;
+extern const lv_image_dsc_t picture_icon_wmo_moderate_rain_s_data;
+extern const lv_image_dsc_t picture_icon_wmo_heavy_rain_s_data;
+extern const lv_image_dsc_t picture_icon_wmo_showers_s_data;
+extern const lv_image_dsc_t picture_icon_wmo_thunder_s_data;
+extern const lv_image_dsc_t picture_icon_wmo_light_snow_s_data;
+extern const lv_image_dsc_t picture_icon_wmo_snow_showers_s_data;
 
 /*
  * id -> 图标的对照表。
@@ -116,6 +149,33 @@ static const struct {
     { PICTURE_ICON_CAMERA,   &picture_icon_camera_data   },
     { PICTURE_ICON_PHOTO,    &picture_icon_photo_data    },
     { PICTURE_ICON_SETTINGS, &picture_icon_settings_data },
+    { PICTURE_ICON_WEATHER,  &picture_icon_weather_data  },
+
+    /* 天气条件图标：每类 96px 与 32px 相邻成对 */
+    { PICTURE_ICON_WMO_CLEAR,         &picture_icon_wmo_clear_data         },
+    { PICTURE_ICON_WMO_CLEAR_S,       &picture_icon_wmo_clear_s_data       },
+    { PICTURE_ICON_WMO_PARTLY,        &picture_icon_wmo_partly_cloudy_data },
+    { PICTURE_ICON_WMO_PARTLY_S,      &picture_icon_wmo_partly_cloudy_s_data },
+    { PICTURE_ICON_WMO_OVERCAST,      &picture_icon_wmo_overcast_data      },
+    { PICTURE_ICON_WMO_OVERCAST_S,    &picture_icon_wmo_overcast_s_data    },
+    { PICTURE_ICON_WMO_FOG,           &picture_icon_wmo_fog_data           },
+    { PICTURE_ICON_WMO_FOG_S,         &picture_icon_wmo_fog_s_data         },
+    { PICTURE_ICON_WMO_FREEZING,      &picture_icon_wmo_freezing_data      },
+    { PICTURE_ICON_WMO_FREEZING_S,    &picture_icon_wmo_freezing_s_data    },
+    { PICTURE_ICON_WMO_LIGHT_RAIN,    &picture_icon_wmo_light_rain_data    },
+    { PICTURE_ICON_WMO_LIGHT_RAIN_S,  &picture_icon_wmo_light_rain_s_data  },
+    { PICTURE_ICON_WMO_MODERATE_RAIN, &picture_icon_wmo_moderate_rain_data },
+    { PICTURE_ICON_WMO_MODERATE_RAIN_S, &picture_icon_wmo_moderate_rain_s_data },
+    { PICTURE_ICON_WMO_HEAVY_RAIN,    &picture_icon_wmo_heavy_rain_data    },
+    { PICTURE_ICON_WMO_HEAVY_RAIN_S,  &picture_icon_wmo_heavy_rain_s_data  },
+    { PICTURE_ICON_WMO_SHOWERS,       &picture_icon_wmo_showers_data       },
+    { PICTURE_ICON_WMO_SHOWERS_S,     &picture_icon_wmo_showers_s_data     },
+    { PICTURE_ICON_WMO_THUNDER,       &picture_icon_wmo_thunder_data       },
+    { PICTURE_ICON_WMO_THUNDER_S,     &picture_icon_wmo_thunder_s_data     },
+    { PICTURE_ICON_WMO_LIGHT_SNOW,    &picture_icon_wmo_light_snow_data    },
+    { PICTURE_ICON_WMO_LIGHT_SNOW_S,  &picture_icon_wmo_light_snow_s_data  },
+    { PICTURE_ICON_WMO_SNOW_SHOWERS,  &picture_icon_wmo_snow_showers_data  },
+    { PICTURE_ICON_WMO_SNOW_SHOWERS_S, &picture_icon_wmo_snow_showers_s_data },
 };
 
 const lv_image_dsc_t *picture_icon(const char *id)

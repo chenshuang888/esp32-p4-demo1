@@ -12,7 +12,10 @@
  *
  * 生命周期：main 在启动时调一次 wifi_service_init()，之后一直常驻 ——
  * 没有 deinit，也不打算做"按需开关"。这和 usb_camera 是同一个取舍：
- * 网络断了要自己重连，它不是一个能随便拆掉再建的外设。
+ * 它不是一个能随便拆掉再建的外设。
+ *
+ * ⚠️ **本组件不做自动重连**：连不上就停在"连不上"，由调用方/用户决定要不要再来一次
+ *    （曾经有一套"重试 N 次再放弃"，已删掉 —— 行为可预测、日志不刷屏更重要）。
  *
  * 为什么 init / set_credentials / connect 是三步而不是一步：
  * 让"先扫描看清楚再连接"成为可能（排查时想先知道周边有什么、目标 AP 是什么加密方式）。
@@ -119,8 +122,9 @@ esp_err_t wifi_service_set_credentials(const char *ssid, const char *password);
  * ⚠️ **隐藏 SSID 的 AP 不返回**：它们的名字是空的，在列表里就是一行空白，没有意义
  *    （而且空白行和"字体缺字形"看起来一样，容易互相误导）。
  *
- * ⚠️ 会打断已建立的连接（扫完由事件回调自动重连）。请在 init 之后、connect 之前
- *    调用，或明确接受这次闪断。
+ * ⚠️ 可能打断已建立的连接。**本组件不会自动重连**（见文件头的说明），
+ *    所以扫完之后连接如果掉了，要自己再调 wifi_service_connect()。
+ *    实测（板载 C6 + 路由器）：连着 AP 扫描两次都没掉线 —— 但不要依赖这一点。
  *
  * @param[out] out    AP 数组
  * @param[in]  cap    out 能装几条；WIFI_SERVICE_SCAN_MAX 是够用的参考值
@@ -133,19 +137,26 @@ esp_err_t wifi_service_set_credentials(const char *ssid, const char *password);
 esp_err_t wifi_service_scan(wifi_service_ap_t *out, size_t cap, size_t *count);
 
 /**
- * @brief 连接上一步 set_credentials() 设好的那个 AP（**非阻塞**）
+ * @brief 连到上一步 set_credentials() 设好的那个 AP
  *
- * 连上 / 断开都通过事件回调打日志。要查"现在连上没有"用 wifi_service_is_connected()；
- * 失败了想知道原因用 wifi_service_last_disconnect_reason()。
- * 失败重试由事件回调负责（上限见 .c 里的 WIFI_MAX_RETRY）。
+ * **已经连着别的 AP 时也能用**：会先断开当前 AP、等断开完成，再连新目标。
+ * （IDF 的约定是 `esp_wifi.h:439` —— 连着 AP 时 esp_wifi_connect() 不会切网，
+ *   必须先 disconnect。少了这一步"换网"会静默失败：返回 OK 但站还在旧 AP 上。）
+ * 只有"换网"这条路会等到约 200ms，之后**非阻塞**返回；连上/断开都靠事件回调打日志。
+ *
+ * ⚠️ **不自动重试**：这条是"让它开始连"，不是"保证连上"。连不上就停在连不上，
+ *    要不要再来一次由调用方决定（界面上就是"用户自己再点一次"）。
+ *    要查现在连上没有用 wifi_service_is_connected()；失败原因用
+ *    wifi_service_last_disconnect_reason()。
  *
  * ⚠️ **还没有凭据时返回 ESP_ERR_INVALID_STATE**（并且只打一条日志）。
  *    刻意不去赌驱动 flash 里残留的旧配置 —— 那样"能不能连上"取决于上次烧过什么，
  *    是最难查的一类问题。
  *
- * @return ESP_OK               已开始连接
+ * @return ESP_OK               已发起连接
  *         ESP_ERR_INVALID_STATE init 没成功过 / 还没有凭据
- *         其余                 esp_wifi_connect() 返回的错误
+ *         ESP_FAIL             换网时等断开超时
+ *         其余                 esp_wifi_connect() / esp_wifi_disconnect() 返回的错误
  */
 esp_err_t wifi_service_connect(void);
 
@@ -156,8 +167,8 @@ esp_err_t wifi_service_connect(void);
  *
  * ⚠️ 跑在**默认事件循环任务**上下文，不是 LVGL 任务 —— 里面**不要碰 lv_xxx**。
  *
- * ⚠️ **每次**拿到 IP 都会回调：开机的首次连接、扫描打断后的自动重连、
- *    以及以后在设置 App 里换网重连。所以回调实现必须**幂等**。
+ * ⚠️ **每次**拿到 IP 都会回调：开机的首次连接、掉线后用户手动重连、
+ *    以及在设置 App 里换到别的网之后。所以回调实现必须**幂等**。
  *
  * 存在的意义：让"网络一来就做某事"不必轮询。本项目的第一个使用者是
  * net_time —— main 把它接到 net_time_start()，连上即对时；此后任何
