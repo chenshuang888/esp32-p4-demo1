@@ -167,3 +167,57 @@ CONFIG_ESP_HOSTED_SDIO_PIN_D1=15
 CONFIG_ESP_HOSTED_SDIO_PIN_D2=16
 CONFIG_ESP_HOSTED_SDIO_PIN_D3=17
 CONFIG_ESP_HOSTED_SDIO_GPIO_RESET_SLAVE=54
+
+# ==================== 临时诊断：SNTP 首次对时偶发要 100+ 秒 ====================
+#
+# 【已定位并修掉，2026-09-27】结论：丢的是"到 NTP 端点的那一次 UDP 123 交换"，
+# 跟设备/链路/校园网都无关 —— 是某些 NTP 端点自己的成功率低（两台独立设备合计：
+# aliyun 58% vs 腾讯 95%、pool 90%、cloudflare 85%、ntsc 30%），而 lwip 的
+# 15/30/60 秒退避把它放大成 150 秒。修复 = 服务器换成 ntp.tencent.com。
+# 完整证据在 components/net_time/net_time_diag.c 顶部 + net_time.c 的
+# NET_TIME_SERVER 注释。
+#
+# ⚠️ 下面三个开关**当前已停用**（都注释掉了）—— 它们只是那次排查的取证手段。
+#    要重新启用：取消注释 + **删掉 sdkconfig 重新生成**
+#    （defaults 改不了 sdkconfig 里已经存在的符号）。
+#    各自能证明什么，留着备查：
+#      A. 请求根本没离开 P4（被 esp_hosted 主动限流丢弃）  -> PKT_STATS
+#      B. 写 SDIO 失败                                    -> PKT_STATS
+#      C. 请求出去了但响应没回来（链路/AP/服务器）        -> PKT_STATS + SNTP_DEBUG
+#      D. 响应回来了但被 lwip 拒了                        -> SNTP_DEBUG
+#         （D 概率低：IDF 的 SNTP_CHECK_RESPONSE=0，lwip 连源地址都不校验）
+
+# --- 1) esp_hosted 传输层包统计 ---
+# 开了之后 esp_hosted 自带一个线程，**每 10 秒**打一行（create_debugging_tasks()
+# 在 sdio_drv.c:781 被调用，不需要我们写代码）：
+#     I (xx) stats: slave: sta_rx_in: N sta_rx_out: N sta_tx_in [pass: N drop: N] sta_tx_out: N
+#     I (xx) stats: wifi_tx_throttling N
+# ⚠️ 日志前缀写的是 "slave:"，但这五个其实是**主机侧（P4）SDIO 驱动**的计数器，
+#    esp_hosted 这标签起得误导。各自的自增点：
+#     sta_tx_in_pass  lwip 交下来的包、通过检查准备发      sdio_drv.c:1134
+#     sta_tx_out      真的写到 SDIO 上去了                 sdio_drv.c:502
+#     sta_rx_in       从 SDIO 收到了（校验和通过）          sdio_drv.c:559
+#     sta_tx_in_drop  **被 host 主动丢弃的**                transport_drv.c:224
+# 判据（拿 SNTP 失败的时刻去对增量）：
+#     drop 涨 / wifi_tx_throttling=1  -> A：host 主动限流丢的（当前头号嫌疑）
+#     pass 涨但 out 不涨              -> B：SDIO 写失败
+#     out 涨但 rx_in 不涨             -> C：出去了没回来
+# ⚠️ 停用中（要启用先取消注释，再删 sdkconfig 重新生成）
+# CONFIG_ESP_HOSTED_PKT_STATS=y
+
+# --- 2) lwip 的 SNTP 调试日志 ---
+# LWIP_DEBUG 是总开关（它**不**会顺带打开别的模块），SNTP_DEBUG 单独控制 SNTP。
+# 接线已确认：CONFIG_LWIP_SNTP_DEBUG -> SNTP_DEBUG=LWIP_DBG_ON（lwipopts.h:1502）。
+# 能看到：每次发出请求、每次重试排期、以及**任何被拒的包**（Invalid mode /
+# Invalid packet length / Invalid originate timestamp）。
+#
+# 注意：这里**故意不设** CONFIG_LWIP_DEBUG_ESP_LOG。
+#   设了的话 lwip 的调试会走 `ESP_LOG_LEVEL(ESP_LOG_DEBUG, "lwip", ...)`
+#   （port/esp32xx/include/arch/cc.h:62-67），而本工程 CONFIG_LOG_MAXIMUM_LEVEL=3
+#   （= INFO），**ESP_LOG_DEBUG 会被整条编译掉 → 一个字都看不到**（比"看不到时间戳"更糟）。
+#   不设则走 cc.h 的另一分支 `printf`，一定会出现在串口。
+#   代价：这些行**没有时间戳**，要靠"在输出流里的出现顺序"和带时间戳的 `stats:` 行对位。
+# ⚠️ 停用中（要启用先取消注释，再删 sdkconfig 重新生成）
+# CONFIG_LWIP_DEBUG=y
+# CONFIG_LWIP_SNTP_DEBUG=y
+

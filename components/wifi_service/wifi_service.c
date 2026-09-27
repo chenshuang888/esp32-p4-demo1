@@ -242,6 +242,34 @@ esp_err_t wifi_service_init(void)
         return err;
     }
 
+    /* ---- 关掉 WiFi 省电（modem sleep）----
+     *
+     * IDF 的默认省电模式是 **WIFI_PS_MIN_MODEM**（esp_wifi.h 里 set_ps/get_ps 的
+     * "@attention Default power save type is ..."）。开着的时候 station 要等 DTIM
+     * 才醒来收包，**UDP 单包**（DNS 查询、SNTP 的请求/响应都是 UDP）可能被延迟甚至
+     * 丢掉；TCP 看不出来，因为它会自己重传。本板是 7 寸屏 + 市电，这点功耗无所谓，
+     * 所以显式设成不休眠，把这一项行为钉死。
+     *
+     * ⚠️ 这行**不是**"SNTP 偶发 150 秒"那个问题的原因 —— 那次已经查明是某些 NTP
+     *    端点自己丢 UDP 123 请求（见 components/net_time/net_time_diag.c 顶部）。
+     *    留着它是因为：实测 C6 当前默认也是 NONE（行为不变），但显式写死能保证
+     *    以后升级 esp_hosted / C6 固件之后它仍然是关的。
+     *
+     * 注意：WiFi 协议栈实际跑在板载 **C6** 上，这个调用会被 esp_wifi_remote 经 SDIO
+     * 转发过去（esp_wifi_with_remote.c 的 esp_wifi_set_ps -> esp_wifi_remote_set_ps），
+     * 所以改的是 C6 那一侧。下面用 esp_wifi_get_ps() 读回来，确认它真的生效了。 */
+    err = esp_wifi_set_ps(WIFI_PS_NONE);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "关闭 WiFi 省电失败: %s（仍按默认 MIN_MODEM 运行）", esp_err_to_name(err));
+    } else {
+        wifi_ps_type_t ps = WIFI_PS_MIN_MODEM;
+        if (esp_wifi_get_ps(&ps) == ESP_OK) {
+            ESP_LOGI(TAG, "WiFi 省电模式读回: %s",
+                     ps == WIFI_PS_NONE      ? "NONE（已关闭）" :
+                     ps == WIFI_PS_MIN_MODEM ? "MIN_MODEM（⚠️ 没生效，还是默认）" : "MAX_MODEM");
+        }
+    }
+
     s_inited = true;
     ESP_LOGI(TAG, "WiFi 已就绪（STA 模式，等待凭据）");
     return ESP_OK;

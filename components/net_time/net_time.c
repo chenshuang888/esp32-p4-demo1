@@ -9,6 +9,11 @@
  *    这里只做一件事：把 tv_sec 转成 int64 交给注入进来的回调。
  */
 #include "net_time.h"
+/* ⚠️ 临时诊断（SNTP 偶发 150 秒那次排查用的）—— 当前**停用**。
+ *    要重新启用，三处一起放开：CMakeLists 里那两行 + 本文件里这三处
+ *    （这个 include、下面的 note_synced()、net_time_start() 里的 start()）。
+ *    详细说明写在 CMakeLists 顶部，探测本体在 net_time_diag.c。 */
+/* #include "net_time_diag.h" */
 
 #include <stdbool.h>
 #include <sys/time.h>
@@ -20,8 +25,22 @@ static const char *TAG = "net_time";
 
 /* NTP 服务器。选国内可达性好的那一个；**运行时设置**，不走 sdkconfig
  * （sdkconfig 里的 CONFIG_LWIP_SNTP_MAX_SERVERS=1，所以只用 idx 0）。
- * 想换服务器改这里一行即可。 */
-#define NET_TIME_SERVER  "ntp.aliyun.com"
+ * 想换服务器改这里一行即可。
+ *
+ * ⚠️ 2026-09-27 从 ntp.aliyun.com 换成 ntp.tencent.com —— 有实测依据：
+ *    同一张校园网、**两台独立设备**（本板 + 一台 PC）各发几十个 NTP 请求：
+ *        ntp.tencent.com      36/38  (95%)   36~45 ms
+ *        cn.pool.ntp.org      27/30  (90%)
+ *        time.cloudflare.com  17/20  (85%)
+ *        ntp.aliyun.com       22/38  (58%)   ← 原来用的这个
+ *        ntp.ntsc.ac.cn        6/20  (30%)
+ *    而同期 ICMP 打同一个 203.107.6.88 是 60/60 全通 —— 丢的是"NTP 这次交换"，
+ *    和链路/设备/校园网都无关。
+ *
+ * 为什么这一行值得改：aliyun 的丢包还会**成串**出现，而 lwip 的退避是
+ * 15/30/60 秒翻倍（sntp_opts.h:164/189/194）→ 连丢 3 次就是 150 秒。
+ * 换成腾讯后"连丢 3 次"的概率大约从 7% 掉到 0.01%。 */
+#define NET_TIME_SERVER  "ntp.tencent.com"
 
 static net_time_synced_cb_t s_on_synced  = NULL;
 static bool                s_configured  = false;   /* net_time_init() 过 */
@@ -32,6 +51,9 @@ static bool                s_started     = false;   /* esp_sntp_init() 过 */
  * 触发的强制重问）。重复通知是**对的**：能顺便校正走时漂移。 */
 static void on_sntp_sync(struct timeval *tv)
 {
+    /* ⚠️ 临时诊断，已停用（重新启用见文件顶部）：
+     *    net_time_diag_note_synced(); */
+
     if (s_on_synced != NULL) {
         s_on_synced((int64_t)tv->tv_sec);
     }
@@ -66,6 +88,9 @@ esp_err_t net_time_start(void)
         esp_sntp_init();
         s_started = true;
         ESP_LOGI(TAG, "SNTP 已启动，等待首次对时");
+
+        /* ⚠️ 临时诊断，已停用（重新启用见文件顶部）：
+         *    net_time_diag_start(NET_TIME_SERVER); */
     } else {
         /* 又拿到一次 IP（换 AP / 重连）：强制立刻重问一次，别等更新周期
          * （CONFIG_LWIP_SNTP_UPDATE_DELAY 默认 1 小时）。 */
