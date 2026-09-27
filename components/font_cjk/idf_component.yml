@@ -1,0 +1,8 @@
+## IDF Component Manager Manifest File
+## 中文字体资源组件：
+##   - 字体对象本身就是 LVGL 的 lv_font_t，所以依赖 lvgl
+##   - 用 lvgl_port_lock() 保护从 main 任务发起的 LVGL 调用（LVGL 有自己的任务在跑）
+dependencies:
+  idf: ">=5.3"
+  espressif/esp_lvgl_port: "^2"
+  lvgl/lvgl: "~9.5.0"

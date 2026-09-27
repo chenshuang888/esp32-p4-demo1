@@ -89,6 +89,30 @@ CONFIG_LV_FONT_MONTSERRAT_44=y
 CONFIG_LV_FONT_MONTSERRAT_46=y
 CONFIG_LV_FONT_MONTSERRAT_48=y
 
+# ---- 中文字体（components/font_cjk）需要的两项 ----
+#
+# 1) LV_USE_FONT_COMPRESSED —— **不开就会"中文一片空白"**
+#    lv_font_conv 默认输出 RLE **压缩**格式的位图（生成物里 .bitmap_format = 1）。
+#    LVGL 的压缩解码器默认关闭（Kconfig 里这个 bool 没有 default，即默认 n），
+#    于是 lv_font_get_bitmap_fmt_txt() 会走到这个分支直接返回：
+#        lv_font_fmt_txt.c:  #else /*!LV_USE_FONT_COMPRESSED*/ ... return NULL;
+#    症状很隐蔽：**中文什么都不显示，而且因为没有"缺字形"所以连占位方块都不画**
+#    （LV_USE_FONT_PLACEHOLDER 只管"找不到字形"，管不了"找到但取不到位图"）。
+#    压缩版 967 KB vs 不压缩 1036 KB（本字表 @18px）—— 压缩反而更小，所以留着压缩。
+#
+# 2) LV_FONT_FMT_TXT_LARGE —— 把 glyph_dsc.bitmap_index 从 20 位放宽到 32 位
+#    20 位即位图上限 1 MB（src/font/fmt_txt/lv_font_fmt_txt.h）。当前字表 @18px
+#    是 967 KB（94.5%），虽然还没撞线，但换个字号/更大的字表立刻就超，而超了
+#    lv_font_conv 会在生成的 .c 里埋 `#error`。**一次开掉，以后换字表/加字号都不用再动配置。**
+#    代价：glyph_dsc 每个字形从 8 字节变 12 字节 —— 本字体 8763 个字形约 +34 KB；
+#    另外 Montserrat 各档也会跟着变宽，合计约 +12 KB。
+#
+# ⚠️ 这两项在现有 sdkconfig 里已经是 "# ... is not set" 状态，而 defaults 只对
+#    "尚未出现"的符号生效 —— **所以改完必须删掉 sdkconfig 重新生成**（见上面那段的说明）。
+CONFIG_LV_USE_FONT_COMPRESSED=y
+CONFIG_LV_FONT_FMT_TXT_LARGE=y
+
+
 # ---- USB Host（USB 摄像头 / UVC 需要）----
 # 这两项是 UVC 能不能工作的**前提**，不是调优项：
 #

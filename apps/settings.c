@@ -287,7 +287,10 @@ static void wifi_start_scan(void)
              *    加密方式也**必须带精度**（"%.4s"）—— 传个条件表达式给 %s 时
              *    GCC 推不出上界，会以 -Werror=format-truncation 报错
              *    （photo.c 里踩过同一个坑）。
-             *    中文 SSID 在这里会变成一串占位方块（没有中文字体），是已知限制。 */
+             *    中文 SSID 能正常显示：默认字体挂了中文 fallback
+             *    （见 components/font_cjk/）。但 SSID 是**裸字节**，得本身是
+             *    UTF-8 才行；发 GBK 的路由器仍会是方块。按字节截断也可能把一个
+             *    汉字截成半个（32 字节上限下，11 个汉字就会到边界）。 */
             snprintf(row, sizeof(row), "%.32s    %.4s    %d dBm",
                      s_aps[i].ssid,
                      s_aps[i].secure ? "WPA2" : "OPEN",

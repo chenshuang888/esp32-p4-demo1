@@ -43,6 +43,8 @@ components/
   ui/                UI 层：把 LVGL 接到屏幕；ui_status_bar 是全局公共状态栏
   lcd_screen/        硬件层：面板与触摸初始化，只暴露句柄
   picture/           图片资源：壁纸与图标（数据由脚本生成）
+  font_cjk/          字体资源：中文（《通用规范汉字表》8105 字，18px）+ 把它接成全局默认；
+                     英文/数字仍走默认字体，中文靠 LVGL 的 fallback 补上，可中英混排
   kv_store/          能力：键值存储（NVS 后端）
   time_service/      能力：时间（对时 + 时区，不认识任何时间源）
   net_time/          能力：SNTP 对时（网络时间源；不认识 wifi，也不认识 time_service）
@@ -91,6 +93,24 @@ components/
   所以需要不同字号时直接 `lv_obj_set_style_text_font(obj, &lv_font_montserrat_XX, 0)` 即可，
   不必再改配置。首个使用者是 Weather 的大温度（48 号）。
   ⚠️ 上限就是 48（LVGL 预置最大，没有 64/72/96）；>48px 的出路见 `sdkconfig.defaults` 的注释。
+
+- **中文**：`components/font_cjk/` 提供一套 **《通用规范汉字表》全表 8105 字（18px）**
+  的位图字体，由 `main` 在 `ui_init()` 之后调 `font_cjk_install()` 接成全局默认。
+  - 英文/数字仍由 Montserrat 渲染（观感不变），只有 Montserrat 没有的字形
+    （中文）才回退到思源黑体 —— 靠的是 LVGL 的字体 `fallback`。
+  - **依赖 `sdkconfig.defaults` 里的两个开关（都已开）**：
+    - `CONFIG_LV_USE_FONT_COMPRESSED=y` —— 字体是 RLE 压缩格式（位图 967 KB；
+      不压缩反而 1036 KB）。**不开的话中文一片空白，而且连占位方块都没有**
+      （`LV_USE_FONT_PLACEHOLDER` 只管"字形找不到"，管不了"找到但取不到位图"）。
+    - `CONFIG_LV_FONT_FMT_TXT_LARGE=y` —— 位图索引 20 位→32 位，解除 1 MB 上限
+      （当前 967 KB = 94.5%，换字号/换更大字表立刻会超）。**一次开掉，以后不用再动配置。**
+  - 字表取自 GitHub 的《通用规范汉字表》字表，并**与教育部系统的官方 PDF 全文逐字交叉验证**过
+    （一级 3500 字顺序完全一致、去重恰为 8105 字、修正了 1 处误字）。其中 196 字在
+    扩展B（补充平面）。重生成见 `components/font_cjk/scripts/gen_font.sh`；
+    组装机制、踩过的两个坑、纵向度量的实测数据都写在 `components/font_cjk/font_cjk.c` 顶部。
+  - ⚠️ 中文只做了 18px 一档，而 fallback 是"每个字体对象一份" —— 所以
+    `apps/weather.c` 里显式设过字号的 label（48/24/20/16/22/14）**中文仍是方块**。
+    要那些地方也显示中文，得为对应字号再生成一份。
 
 ## 现有 App
 
@@ -152,13 +172,19 @@ components/
 | **TLS/HTTPS 不能跑在 LVGL 任务里**：那个任务的栈只有 **7168B**（esp_lvgl_port 的 `ESP_LVGL_PORT_INIT_CONFIG()` 默认值，`ui.c` 原样用的），放不下 TLS 握手 + 证书链校验。联网工作必须进自己的任务（IDF 官方 HTTPS 例程用的是 8192 栈的独立任务） | `components/weather_service/weather_service.c` 顶部 |
 | 图标源图不能带水印，否则内容边界会变成整张图 | `components/picture/picture.c` 顶部 |
 | 进 WiFi 列表时**扫描是同步阻塞的**（2~4 秒，界面冻住）；`lv_refr_now()` 是为了让 "Scanning..." 能显示出来，不然连提示都看不到 | `apps/settings.c` 的 `wifi_start_scan` |
-| 中文 SSID 会显示成**一串占位方块**（项目没有中文字体）。不是空白 —— `LV_USE_FONT_PLACEHOLDER` 默认开会画方块 | `components/wifi_service/wifi_service.h` 的 `wifi_service_ap_t` |
+| **压缩字体 + `LV_USE_FONT_COMPRESSED` 没开 = 中文一片空白，而且连占位方块都没有**。`lv_font_conv` 默认输出 RLE 压缩位图（生成物里 `.bitmap_format = 1`），而 LVGL 的压缩解码器默认是关的；此时 `lv_font_get_bitmap_fmt_txt()` 会直接 `return NULL`（`lv_font_fmt_txt.c` 的 `#else /*!LV_USE_FONT_COMPRESSED*/` 分支）。因为字形是"**找到了**、只是取不到位图"，`LV_USE_FONT_PLACEHOLDER` 也轮不上画方块 —— 极易误判成"字体没生效"。接中文字体时踩过 | `components/font_cjk/font_cjk.c` 顶部；`sdkconfig.defaults` 的中文字体段 |
+| 中文 SSID 曾经显示成**一串占位方块**（那时项目还没有中文字体）。现已由 `components/font_cjk` 覆盖；但 SSID 是**裸字节**，本身得是 UTF-8 才能渲染（发 GBK 的路由器仍是方块），且 `%.32s` 按字节截断可能切出半个汉字 | `components/font_cjk/font_cjk.c`、`apps/settings.c` 的行格式化处 |
 | **横向滚动容器宽度必须是确定值**（`lv_pct(100)` 或固定 px）。用 `LV_SIZE_CONTENT` 时容器随子项长大，就没有可滚区，横滑**静默失效**；另外 flex 必须保持默认 `NOWRAP` | `apps/weather.c` 的 `s_hour_box` |
 | `lv_obj_remove_style_all()` **会连 layout 一起清掉**，所以 `lv_obj_set_flex_flow/align` 必须在它**之后**调用（顺序反了：不崩，只是布局全错） | `apps/weather.c` 的 `body` / `apps/photo.c` |
 | weather_service 的结果结构体约 304B，**不能放在 worker 的栈上**（那 8192B 的峰值被 TLS 握手占满）—— 用文件级 `static` | `components/weather_service/weather_service.c` 的 `s_report` |
 | 请求不带 `forecast_hours=24` 时，hourly 会按 `forecast_days` 返回**满 7 天**（168 条），响应从 ~1.7KB 涨到 ~5.5KB 直接撑爆 body 缓冲 | `components/weather_service/weather_service.c` 的 `WEATHER_URL` |
 | `LVGLImage.py` 在 Windows 上**吃不了中文路径**：argv 被按 ANSI 码页解码，`原始图片/...` 变乱码 → 报 `invalid input`（加 `python -X utf8` 也没用 —— 参数在进 Python 之前就已经坏了）。绕法：`cd` 进图标目录、只传 **ASCII 文件名** | `原始图片/make_weather_icons.py` 顶部的用法 |
 | **`SPIRAM_XIP_FROM_PSRAM` 会让"多加图片/字体"表现为 free heap 掉几百 KB**：该配置把 flash 里的 `.rodata` + `.text` 整段在启动时搬进 PSRAM（`esp_psram.c` 的 `s_xip_psram_placement()`），且这段 PSRAM 是从可入堆的部分扣掉的；而桌面显示的 `esp_get_free_heap_size()` 把 PSRAM 算在内。所以 heap 少了**不是泄漏、也不是哪个 App 占的**，是固件体积的影子。本次加图标+字体后桌面 heap 掉了约 600KB | `sdkconfig.defaults` 的 PSRAM 段 |
+| 中英混排（字体 fallback）要核对**纵向度量**：回退字形的纵向位置用**它自己**的 `ofs_y`，但行高取**主字体**的 `line_height`。两者差得多就会把字裁掉。本项目实测 Montserrat 18 行盒 17/4，思源黑体汉字 16/2、常用中文标点 ≤16/3 —— 装得下，所以不用改 `line_height` | `components/font_cjk/font_cjk.c` 顶部 |
+| **`lv_obj_add_style()` 加的样式，优先级低于主题的样式 —— 所以它盖不住主题设的字体**。对象内部样式数组是 `[transition][local][normal]`，取值时**正序遍历、同 state 命中即返回**（数组靠前 = 优先级高）。`lv_obj_add_style` 加的是 normal，追加在主题样式**后面** → 被无视。`lv_obj_set_style_*()` 走 `lv_obj_set_local_style_prop()` → local → 排在 normal 前面 → 才能覆盖。**症状就是我们第一次接入中文字体时"设了却显示不出来"** | `components/font_cjk/font_cjk.c` 顶部"⚠️"一节；`lv_obj_style.c:123-131`、`:830-868` |
+| 自定义字体当"全局默认"**不能走 Kconfig**：`CONFIG_LV_FONT_DEFAULT_*` 那个 choice 里只有 LVGL 内置字体。而主题只在**根对象**上设字体（`lv_theme_default.c` 的 `theme_apply()` 里 `parent == NULL` 那条分支），子对象靠继承 —— 所以要么改配置，要么自己挂一条主题链 | `components/font_cjk/font_cjk.c` 的 `root_font_apply` |
+| `lv_layer_top()` / `lv_layer_bottom()` 在 `lv_init()` 阶段就建好了，**主题是在那之前应用**的；而 `lv_display_set_theme()` 基本不重刷已有对象。所以运行期换主题后，已存在的根对象吃不到新主题，得显式补一遍（状态栏就挂在 layer_top 上） | `components/font_cjk/font_cjk.c` 的 `font_cjk_install` |
+| 从 `main` 任务调 LVGL 必须 `lvgl_port_lock()`：LVGL 有自己的任务在跑，不持锁就是竞态 | `components/ui/ui_status_bar.c` 的 `ui_status_bar_init`、`components/font_cjk/font_cjk.c` |
 
 ## 与 demo1 的关系
 

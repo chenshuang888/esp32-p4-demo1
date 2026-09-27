@@ -28,6 +28,7 @@
 #include "wifi_service.h"
 #include "net_time.h"
 #include "weather_service.h"
+#include "font_cjk.h"
 
 static const char *TAG = "app";
 
@@ -203,11 +204,18 @@ void app_main(void)
     /* ---- 4. UI 层：接入 LVGL ---- */
     ESP_ERROR_CHECK(ui_init());
 
-    /* ---- 5. 状态栏：建一份全局的，并把两个外部动作注入进去 ----
+    /* ---- 5. 中文：把中文字体接成全局默认 ----
+     * 必须紧跟 ui_init()（那时 LVGL 的 display 才存在），并在状态栏之前 ——
+     * 状态栏挂在 lv_layer_top() 上，早接早生效。
+     * 英文/数字仍走原本的默认字体，中文靠 LVGL 的 fallback 补上，可以混排。
+     * **不需要动 sdkconfig**，也不需要改默认字体那行配置（理由见 font_cjk.h）。 */
+    ESP_ERROR_CHECK(font_cjk_install());
+
+    /* ---- 6. 状态栏：建一份全局的，并把两个外部动作注入进去 ----
      * 必须在 ui_init() 之后（状态栏要画在 LVGL 上），
      * 在 go_home() 之前（各 App 进 enter 时就要用状态栏）。 */
     ESP_ERROR_CHECK(ui_status_bar_init(status_bar_clock_text, status_bar_back));
 
-    /* ---- 6. 进主页 ---- */
+    /* ---- 7. 进主页 ---- */
     ESP_ERROR_CHECK(app_manager_go_home());
 }
