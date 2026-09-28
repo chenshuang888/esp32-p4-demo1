@@ -1,8 +1,0 @@
-## IDF Component Manager Manifest File
-## 拼音输入法资源组件：
-##   - 词典的对外类型就是 LVGL 的 lv_pinyin_dict_t，接入用的是 lv_ime_pinyin（也在 lvgl 里），
-##     所以依赖 lvgl
-##   - **不依赖 esp_lvgl_port**：本组件不自己加锁，调用方（App 的 enter）天然持有 LVGL 锁
-dependencies:
-  idf: ">=5.3"
-  lvgl/lvgl: "~9.5.0"

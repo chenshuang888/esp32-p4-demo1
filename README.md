@@ -49,15 +49,12 @@ components/
                      三种边：词边、字边、**缩写边（简拼）**；外加**词级用户学习**的内存表
                      + 词典数据（词表 30808 条 / 缩写表 5553 键 / 25281 音串，
                        约 1 MB rodata，由脚本生成）
-  pinyin_keyboard/   自研软键盘（`lv_buttonmatrix` 从零搭，**不用** LVGL 的 lv_keyboard）：
-                     5 行 × 3 页（abc / ABC / 符号）、**数字行常驻**、左下角**中/英**切换。
-                     它只把按键翻成"语义事件"报出去 —— **不认识输入框、也不认识引擎**
-  pinyin_input/      输入控件：决定"每一类键要干什么"，管候选栏、拼音缓冲、上屏
-                     （拼音直接打在输入框里），用 pinyin_engine
+  pinyin_keyboard/   屏幕上的那一套：**自研键盘**（`lv_buttonmatrix` 从零搭，**不用**
+                     LVGL 的 lv_keyboard）+ 候选栏 + 输入法逻辑。5 行 × 3 页、数字行常驻、
+                     左下角中/英切换、数字键直选候选。内部切两半：键盘那半只把按键翻成
+                     "语义"报出去，**不认识输入框、也不认识引擎**
   pinyin_learn/      能力：用户学习记录的持久化 —— 存到 SD 卡、开机读回、App 退出时落盘、
                      可清除。**不认识 LVGL**；引擎反过来**不认识存储**，两边由 main 组装
-  pinyin_ime/        输入资源（**旧版**）：单字拼音词典 + 薄接入 LVGL 自带的 lv_ime_pinyin
-                     —— 保留作兜底，当前没有 App 用它；见"中文输入"一节
   kv_store/          能力：键值存储（NVS 后端）
   time_service/      能力：时间（对时 + 时区，不认识任何时间源）
   net_time/          能力：SNTP 对时（网络时间源；不认识 wifi，也不认识 time_service）
@@ -168,16 +165,21 @@ components/
 
 ## 中文输入（拼音输入法）
 
-工程里有**两套**，App 用哪套就在它的 `enter` 里调哪套的 `attach`：
+**一套自研的**，从算法到键盘都是自己搭的，共三个组件：
 
-| 组件 | 引擎 | 选词方式 | 状态 |
-|---|---|---|---|
-| `pinyin_engine` + `pinyin_input` | **自研**（字母串上做 DP 整句转换） | **整句**：点一次上屏「今天天气」 | **当前在用**（`apps/ime_test.c`） |
-| `pinyin_ime` | LVGL 9.5 自带的 `lv_ime_pinyin` | 逐字 | 旧版，保留作兜底，没 App 用它 |
+| 组件 | 负责什么 |
+|---|---|
+| `pinyin_engine` | 算法：拼音串 -> 整句候选（纯 C、零依赖）。含简拼、词级用户学习 |
+| `pinyin_keyboard` | 屏上那套：**自研键盘**（`lv_buttonmatrix` 从零搭）+ 候选栏 + 输入法逻辑 |
+| `pinyin_learn` | 把用户学习记录存到 SD 卡（开机读回、App 退出时落盘） |
 
-两套都留着是为了"随时切回去对比"。切换只改 `apps/ime_test.c` 里那一行（文件顶部注明了怎么改）。
+一次 `pinyin_keyboard_create()` 就把屏上那套全装好 —— 见下面的"用法"。
 
-### 新的：`pinyin_engine` + `pinyin_input`（当前在用）
+> 工程里曾经还有一版"薄接 LVGL 自带 `lv_ime_pinyin`"的实现（`components/pinyin_ime`），
+> 已经删掉了：它的候选格每格只有 4 字节、**装不下词组**，而 `lv_keyboard` 的布局表又
+> 改不了。要看那版：`git show 24e039d:components/pinyin_ime/`；踩过的坑留在坑表里。
+
+### 引擎：拼音串 -> 整句候选
 
 输入一串拼音 -> 引擎输出若干个**完整的**转换结果，点一个整段上屏：
 
@@ -212,17 +214,17 @@ nhs + j        ->  「你好世界」                  ← 全拼/简拼可以�
   之所以不做单元测试：这台机器上没有任何 host 编译器（gcc/clang/cc 全无）。
 - 用法：
   ```c
-  lv_obj_t *kb = pinyin_kb_create(page, W, PINYIN_KB_HEIGHT);   // 自研键盘
-  lv_obj_align(kb, LV_ALIGN_BOTTOM_LEFT, 0, 0);
-  pinyin_input_attach(kb, ta);                 // 候选栏由它建、自己贴在键盘正上方
+  lv_obj_t *kb = pinyin_keyboard_create(body, ta, W, PINYIN_KEYBOARD_HEIGHT);
   lv_obj_add_event_cb(kb, on_submit, LV_EVENT_READY, NULL);   // 回车 = 提交
   ```
-  App 排版面时用 `PINYIN_INPUT_BAR_H` 和 `PINYIN_KB_HEIGHT` 给它们留高度（别写死数字）；
-  `leave` 里要调 `pinyin_input_detach()`（它把对象指针存在 static 里，顺带落盘学习记录）。
-  提交事件仍然走 `LV_EVENT_READY`，**App 的写法不用变** —— 键盘本身不认识"提交"，
-  是 `pinyin_input` 收到回车键后往键盘对象上补发一个 READY。
-  ⚠️ **`ta` 的内容归控件管**：拼音字母是打在 `ta` 里的（拼音 + 已上屏汉字共用一个框），
-  光标会被强制拉到末尾；拼音没上屏时不要从外面往里写字。`pinyin_input_reset()`
+  一次调用把键盘、候选栏、输入法逻辑全装好。App 排版面时按 `PINYIN_KEYBOARD_TOTAL_H`
+  （= 键盘 280 + 候选栏 44）给它们留高度，**不要自己 align 键盘** —— 键盘和候选栏是
+  一体的，位置由组件摆（贴 `parent` 底部）。`leave` 里调 `pinyin_keyboard_detach()`
+  （顺带把学习记录落盘）。
+  提交事件仍然走 `LV_EVENT_READY`：键盘本身不认识"提交"，是本组件收到回车键后往键盘
+  对象上补发一个 READY，所以 App 的写法一直没变。
+  ⚠️ **`ta` 的内容归本组件管**：拼音字母是打在 `ta` 里的（拼音 + 已上屏汉字共用一个框），
+  光标会被强制拉到末尾；拼音没上屏时不要从外面往里写字。`pinyin_keyboard_reset()`
   会把框里那串拼音一并删掉。
 - 重新生成词典：`python components/pinyin_engine/scripts/gen_engine_dict.py`
   （幂等，含断言 + 写回自检 + 用同一套量化值跑一遍 Python 参考实现报准确率）
@@ -232,7 +234,7 @@ nhs + j        ->  「你好世界」                  ← 全拼/简拼可以�
 **为什么自己做**：LVGL 的 `lv_keyboard` 布局表是 `lv_keyboard.c` 里的**文件内 static 数组** ——
 外部既改不了键上写什么字，也**拿不到 ctrl_map**（只有 set、没有 get）。而"把中文输入
 做顺手"要的恰好是这些。所以改用 `lv_buttonmatrix` 从零搭，只借用 LVGL 的通用控件层
-（就像不去自己写 label 的渲染一样）。
+（就像不去自己写渲染一样）。
 
 布局（5 行 × 3 页：`abc` / `ABC` / `符号`）：
 
@@ -245,17 +247,23 @@ a s d f g h j k l
 ```
 
 - **中/英在左下角**（真键盘也在这儿），键面直接写当前模式（`中` / `EN`）。
-  切换时键盘会报 `PN_KB_KEY_MODE_CHANGED`，`pinyin_input` 据此把没上屏的拼音"定案"
+  切换时会顺带通知输入法那半，把没上屏的拼音"定案"
 - 键表里每个键同时写清 **键面文字 / 语义 / 相对宽度**，而**分发只看语义、不看文字** ——
   所以 `中/EN` 那个键的文字随模式变，也不会让按键识别错位
 - 宽度是**同一行内的相对值**（1..15），LVGL 按比例分完整行；所以"一个键多宽"取决于
   它和同行其它键的比值，而不是绝对值（第三行 9 个键自然比上面两行的 10 键宽一点）
-- 它**不认识输入框、也不认识引擎**：只报"按了字母/数字/标点/退格/空格/回车"。
-  正因如此，"数字键到底是直选候选还是插字符"由 `pinyin_input` 拍板 —— 只有它知道
-  当前有没有候选
+
+**组件内部切了两半**（`pinyin_keyboard.c` 上半是键盘、下半是输入法）：
+
+- **键盘那半不认识输入框、也不认识引擎**：只把按键翻成"字母/数字/标点/退格/空格/回车"
+  报出去。正因如此，"数字键到底是直选候选还是插字符"由**输入法那半**拍板 ——
+  只有它知道当前有没有候选
+- 这条边界**跟"两半在不在一个文件里"无关**，它是防止键盘逻辑变浑的东西（键盘不该
+  去猜"现在有没有候选"）。接缝就是那一个 `on_key()`
 
 ⚠️ **换页/换模式之后必须重贴 ctrl_map**：`lv_buttonmatrix_set_map()` 会重建按键区域、
-把宽度和键的灰色底一起冲掉。见 `set_page()` 里的顺序说明。
+把宽度和键的灰色底一起冲掉。所以这两件事永远成对做，走 `apply_page()`。
+（曾经在"切中/英"那条路上漏过一次 —— 症状是**一切语言，所有键宽退回默认、灰键变白**。）
 
 ⚠️ **布局表里的 `"\n"` 不是按键**：它只表示换行，而
 `lv_buttonmatrix_get_selected_button()` 返回的下标**不含**它。所以键盘内部维护两套下标
@@ -316,58 +324,24 @@ a s d f g h j k l
 （本次开机内学习照常生效，只是不持久化）。
 设置 App 里有一条 **"Clear learned words"** —— 学习表会脏，没有出口就下不来。
 
-### 旧的：`pinyin_ime`（保留兜底）
+### 曾经的那一版：`pinyin_ime`（已删除）
 
-输入法本身**不是自研的** —— 薄接入 **LVGL 9.5 自带的 `lv_ime_pinyin`**
-（`managed_components/lvgl__lvgl/src/widgets/ime/lv_ime_pinyin.c`）。它已经带齐了
-拼音缓冲、退格、候选栏、候选栏首尾的 `<` `>` 翻页、"点候选则把它替换成汉字"。
-默认是关的，本项目把它打开并换上自己的词典。我们做的只有两件事：
-**提供词典** + **绕开两个坑**（见坑表）。
+工程里原来还有一版输入法：**薄接入 LVGL 9.5 自带的 `lv_ime_pinyin`**
+（`managed_components/lvgl__lvgl/src/widgets/ime/lv_ime_pinyin.c`），我们只提供词典 +
+绕开它两个坑，逐字选候选。**已经删掉了**，原因：
 
-#### 词典从哪来
+- 它的候选格每格只有 4 字节（源码里的 `lv_pinyin_cand_str[][4]`），**装不下词组** ——
+  所以 `nihao` 要分两次选字；
+- 它要的键盘是 LVGL 自带的 `lv_keyboard`，而那个的布局表我们改不了（见上面"键盘"一节）；
+- 开着它的那几项 Kconfig 还带来"改配置必须先删 `sdkconfig`"的副作用。
 
-`components/pinyin_ime/dicts/lv_pinyin_dict.c`（约 45 KB rodata），由
-`scripts/gen_pinyin_dict.py` 生成，**入库、永不手改**：
+要看那版实现：`git show 24e039d:components/pinyin_ime/`。
+**它踩过的坑留在下面的坑表里** —— 那几条讲的是 LVGL 内部行为（候选串必须 3 字节对齐、
+候选栏字体不继承、键盘左下角键会把 IME 弄坏），不只是旧组件的事。
 
-```bash
-python components/pinyin_ime/scripts/gen_pinyin_dict.py
-```
-
-- 字表复用 `components/font_cjk/chars/guifan_8105.txt` —— **刻意共用**，因为候选字必须是
-  字体能渲染的字，否则选出来就是占位方块。
-- 拼音用 pypinyin（`heteronym=True`，多音字的每个读音都收）；字频用 jieba 的词表按字聚合。
-- 排序依据落盘在 `source/char_freq.tsv`，不装 jieba 也能复核。
-- **候选顺序 = 字频从高到低**，这是输入法好不好用的关键：`yi` 有 176 个候选，
-  没有字频排序的话第一页全是生僻字。
-  ⚠️ 另外还给读音分了档：pypinyin 的 heteronym 会带上**古音/异体等生僻读音**，而候选是按
-  "字的总字频"排的。不分档的话，超高频字会靠一个生僻读音挤进别的音节头几页 ——
-  实测「不、市、还、包」全排在 `fu` 的第一页。所以**主读音排前、其余读音整体降到末尾**。
-  代价是多音字在次要读音下要靠后找（如 `行` 在 `hang` 下不是第一个），但它仍然打得出来。
-
-#### 要开的配置（`sdkconfig.defaults` 里已写，理由也写在那儿）
-
-```
-CONFIG_LV_USE_IME_PINYIN=y                 总开关
-CONFIG_LV_IME_PINYIN_USE_DEFAULT_DICT=n    关掉内置的**繁体**词典（只占地方，且会让故障变隐蔽）
-CONFIG_LV_IME_PINYIN_CAND_TEXT_NUM=9       候选栏每页 9 个（默认 6，翻页太慢）
-```
-
-⚠️ 这三项在当前 `sdkconfig` 里已是 `# ... is not set`，而 defaults 只对"尚未出现"的符号
-生效 —— **改完必须删掉 `sdkconfig` 重新生成**（同字体那两项的说明）。
-
-#### 怎么在别处用
-
-```c
-lv_obj_t *kb  = lv_keyboard_create(page);
-lv_obj_t *ime = pinyin_ime_attach(kb);          // 必须在键盘建好之后
-lv_keyboard_set_textarea(kb, ta);               // 键盘照常要绑 textarea
-lv_obj_t *cand = lv_ime_pinyin_get_cand_panel(ime);   // 候选栏 = 键盘的兄弟对象
-lv_obj_set_size(cand, lv_pct(100), 44);               // 位置/大小由调用方摆
-lv_obj_align_to(cand, kb, LV_ALIGN_OUT_TOP_MID, 0, -8);
-```
-
-⚠️ **不要给 WiFi 密码那种字段挂它**（`apps/settings.c`）—— 那种字段要的是原样 ASCII，
-挂上输入法反而会把输入的字母当拼音吃掉。（**新的那套同理**。）
+⚠️ **不要给 WiFi 密码那种字段挂输入法** —— `apps/settings.c` 的密码框用的是 LVGL 自带的
+`lv_keyboard`，本来就没挂 IME。那种字段要的是原样 ASCII，挂上输入法反而会把输入的字母
+当拼音吃掉。
 
 ### 已知限制
 
@@ -379,9 +353,9 @@ lv_obj_align_to(cand, kb, LV_ALIGN_OUT_TOP_MID, 0, -8);
 - **简拼只覆盖 2~4 字词**：更长的短语靠 DP 组合（`zhrmghg` → 中华+人民+共和国），
   不是从表里直接命中的 —— 所以"组合出来的"那个结果可能输给某个恰好整个匹配的罕见词
   （实测 `nhsj` 不是「你好世界」，因为「你好世界」不在词表里）。
-- **不支持"部分重选"**：新那套把整句当一个候选，第一个不对就换一个候选或退格重来；
+- **不支持"部分重选"**：整句当一个候选，第一个不对就换一个候选或退格重来；
   不能在已上屏的句子里单独改某个词（真实输入法有，要拆词重排）。
-- **拼不出就不给候选**：新那套对 `nihap` 直接返回 0（不会退而给出"部分转换"，
+- **拼不出就不给候选**：`nihap` 直接返回 0（不会退而给出"部分转换"，
   那串拼音还留在输入框里，可以退格）。
 - **数字直选只覆盖 `1`~`9`**：候选最多 12 个，第 10 个往后只能点候选栏。
 - **拼音打到一半按标点，会先把拼音"定案"**：打 `ni` 再按 `，` 得到的是字面量 `ni，`
@@ -395,15 +369,8 @@ lv_obj_align_to(cand, kb, LV_ALIGN_OUT_TOP_MID, 0, -8);
 - **学习记录在 App 退出时才落盘**，会阻塞 LVGL 任务几十毫秒（那会儿正在切页，看不出来）；
   代价是"选完词立刻拔电"会丢最后一批。若实测卡顿，再考虑挪到独立任务。
 
-旧那套另外还多三条（新那套没有）：
-
-- **只能单字候选，没有词组联想** —— LVGL 的候选缓冲每格只有 4 字节
-  （源码里的 `lv_pinyin_cand_str[][4]`），装不下词。所以 `nihao` 要分两次选字。
-- **有 196 个字打不出来** —— CJK 扩展 B/C/D/E 的字是 4 字节 UTF-8，会破坏候选切片
-  （见坑表），生成词典时整字剔除了。它们都在三级字表里，日常用不到。
-  （新那套没有这个限制：它的候选缓冲是通用的，4 字节字也能显示。）
-- **全局只能有一个实例** —— 候选字符串数组是 `lv_ime_pinyin.c` 的文件级 `static`
-  （新那套同样是单实例，因为状态放在 static 里）。
+（已删除的 `pinyin_ime` 另有"只能单字候选""196 个 4 字节字打不出来"等限制 ——
+那些随组件一起没了，要看的话 `git show 24e039d:components/pinyin_ime/`。）
 
 ## 几个已经踩过的坑（都在代码注释里）
 
@@ -439,18 +406,18 @@ lv_obj_align_to(cand, kb, LV_ALIGN_OUT_TOP_MID, 0, -8);
 | 自定义字体当"全局默认"**不能走 Kconfig**：`CONFIG_LV_FONT_DEFAULT_*` 那个 choice 里只有 LVGL 内置字体。而主题只在**根对象**上设字体（`lv_theme_default.c` 的 `theme_apply()` 里 `parent == NULL` 那条分支），子对象靠继承 —— 所以要么改配置，要么自己挂一条主题链 | `components/font_cjk/font_cjk.c` 的 `root_font_apply` |
 | `lv_layer_top()` / `lv_layer_bottom()` 在 `lv_init()` 阶段就建好了，**主题是在那之前应用**的；而 `lv_display_set_theme()` 基本不重刷已有对象。所以运行期换主题后，已存在的根对象吃不到新主题，得显式补一遍（状态栏就挂在 layer_top 上） | `components/font_cjk/font_cjk.c` 的 `font_cjk_install` |
 | 从 `main` 任务调 LVGL 必须 `lvgl_port_lock()`：LVGL 有自己的任务在跑，不持锁就是竞态 | `components/ui/ui_status_bar.c` 的 `ui_status_bar_init`、`components/font_cjk/font_cjk.c` |
-| **LVGL 自带拼音 IME 的候选串必须"每字 3 字节"**：`cand_num = strlen(py_mb)/3` 且按 3 字节切片（`lv_ime_pinyin.c` 的 `pinyin_input_proc`）—— 掺进 4 字节字（CJK 扩展 B/C/D/E）后，该音节**从那里起所有候选全部错位成乱码**。所以生成词典时整字剔除 196 个 4 字节字 | `components/pinyin_ime/scripts/gen_pinyin_dict.py` |
-| **候选栏的中文不会自己继承字体**：候选栏是 `lv_buttonmatrix`，它的父对象是**键盘的父对象**（是 IME 对象的**兄弟**，不是子对象），所以不从 IME 继承。IME 只在收到 `LV_EVENT_STYLE_CHANGED` 时把字体转过去。必须显式给候选栏设一次字体，否则满屏方块 | `components/pinyin_ime/pinyin_ime.c` 的 `apply_cand_font` |
-| **键盘左下角那个键（`LV_SYMBOL_KEYBOARD`）会把输入法弄坏**：IME 把它当"切 9 键模式"，而 `lv_ime_pinyin_set_mode()` 里 `mode = mode;` 是**无条件**执行的、换键盘布局那段却被 `#if LV_IME_PINYIN_USE_K9_MODE` 包着 —— 本项目不开 K9，于是按一下变成"模式是 K9、布局还是 K26"，之后**所有字母都不再出候选**（不崩、不报错）。绕法：追加一个 `VALUE_CHANGED` 回调把模式按回去 | `components/pinyin_ime/pinyin_ime.c` 的 `on_kb_value_changed` |
-| 拼音词典**必须按 py 升序且同首字母连续**：`init_pinyin_dict()` 靠"首字母变化"建 `py_pos[26]`/`py_num[26]`，检索是在该字母区间里线性扫。排错 = 索引错乱、查不到字（脚本里有断言守住） | `components/pinyin_ime/scripts/gen_pinyin_dict.py` |
-| 大写模式下输入法**不工作**（字母直接以 ASCII 进 textarea）—— 这是**需要的特性**（输 API key / URL 就是要这样），不是缺陷。IME 只接小写 `a-z` | `components/pinyin_ime/include/pinyin_ime.h` 的"已知限制" |
+| **LVGL 自带拼音 IME 的候选串必须"每字 3 字节"**：`cand_num = strlen(py_mb)/3` 且按 3 字节切片（`lv_ime_pinyin.c` 的 `pinyin_input_proc`）—— 掺进 4 字节字（CJK 扩展 B/C/D/E）后，该音节**从那里起所有候选全部错位成乱码**。所以生成词典时整字剔除 196 个 4 字节字（该组件已删，看快照） | `git show 24e039d:components/pinyin_ime/scripts/gen_pinyin_dict.py` |
+| **候选栏的中文不会自己继承字体**：候选栏是 `lv_buttonmatrix`，它的父对象是**键盘的父对象**（是 IME 对象的**兄弟**，不是子对象），所以不从 IME 继承。IME 只在收到 `LV_EVENT_STYLE_CHANGED` 时把字体转过去。必须显式给候选栏设一次字体，否则满屏方块 | `git show 24e039d:components/pinyin_ime/pinyin_ime.c` 的 `apply_cand_font` |
+| **键盘左下角那个键（`LV_SYMBOL_KEYBOARD`）会把输入法弄坏**：IME 把它当"切 9 键模式"，而 `lv_ime_pinyin_set_mode()` 里 `mode = mode;` 是**无条件**执行的、换键盘布局那段却被 `#if LV_IME_PINYIN_USE_K9_MODE` 包着 —— 本项目不开 K9，于是按一下变成"模式是 K9、布局还是 K26"，之后**所有字母都不再出候选**（不崩、不报错）。绕法：追加一个 `VALUE_CHANGED` 回调把模式按回去 | `git show 24e039d:components/pinyin_ime/pinyin_ime.c` 的 `on_kb_value_changed` |
+| 拼音词典**必须按 py 升序且同首字母连续**：`init_pinyin_dict()` 靠"首字母变化"建 `py_pos[26]`/`py_num[26]`，检索是在该字母区间里线性扫。排错 = 索引错乱、查不到字（脚本里有断言守住） | `git show 24e039d:components/pinyin_ime/scripts/gen_pinyin_dict.py` |
+| 大写模式下输入法**不工作**（字母直接以 ASCII 进 textarea）—— 这是**需要的特性**（输 API key / URL 就是要这样），不是缺陷。IME 只接小写 `a-z` | `git show 24e039d:components/pinyin_ime/include/pinyin_ime.h` 的"已知限制" |
 | 候选栏位置**不能用 flex 容器摆**：它的位置是 `lv_obj_align_to(cand, kb, ...)` 算的，而 flex 会接管子对象位置、把 align 覆盖掉（不崩，只是布局全错）。所以 `apps/ime_test.c` 整页刻意用显式 align | `apps/ime_test.c` 顶部版面说明 |
 | **整句转换的 DP 里，边的跨度上限要按"最长音串"而不是"最长音节"**：最长音节 6 字母（zhuang），但一个双字词的音串能到 12 字母（beijing=7、tushuguan=9）、最长 20。按 6 写的话**所有双字以上的词全都不会被考虑**，Top-1 直接 28/30 → 14/30。字边才用"最长音节"限制 | `components/pinyin_engine/pinyin_engine.c` 顶部"两个容易写错的地方" |
 | DP 末尾**必须去重**：不同路径经常产出同一个文本（词边「你好」和字边「你+好」都得 "你好"），不去重候选栏里会出现两个一模一样的候选。去重会消耗候选数，所以每节点保留的路径数要比候选数多几个 | `pinyin_engine.c` 的 `PE_PATH_KEEP`；`gen_engine_dict.py` 的同名常量 |
 | **转换引擎的路径表不能放栈上**（约 14KB）：调用方是 LVGL 任务，它的栈只有 7168B。所以放文件级 static，代价是函数不可重入 | `components/pinyin_engine/pinyin_engine.c` 顶部 |
-| **不能在候选按钮的点击回调里删或重建候选对象**：点候选会上屏并刷新候选栏，而此刻那个按钮的事件正在跑，删它（或它父对象的孩子）会崩。所以候选按钮一次建好，之后只改文本/显隐 | `components/pinyin_input/pinyin_input.c` 的 `refresh_bar` |
-| **输入法控件把键盘/输入框指针存在 static 里**：App 的 `leave` 必须调 `pinyin_input_detach()`。忘了不会崩（再 attach 会覆盖），但显式 detach 才符合"游离资源 leave 里一个都不能漏"那条纪律 | `components/pinyin_input/pinyin_input.c` |
-| **`lv_obj_get_width()` 读的是"缓存坐标"，不是"你设进去的值"**：刚创建（或刚改过尺寸）、还没经过一次布局的对象，`coords` 全是 0。在 `enter()` 里拿它去定另一个对象的尺寸会得到 **0**，而容器默认裁剪子对象 → **整块东西一片空白**。`lv_obj_pos.h` 的 `@note` 写得很明白："坐标只在下一次重绘时才重算"，绕法是取值前先 `lv_obj_update_layout(obj)`。实测症状极具迷惑性：**敲拼音什么都不显示，但 ASCII 直插照常能用**（那条路不碰出问题的那块）。注意 `lv_obj_align_to()` 内部**会**先刷布局（所以它自己能对齐对），是"在调它之前读坐标"才出事 | `components/pinyin_input/pinyin_input.c` 的 `pinyin_input_attach` |
+| **不能在候选按钮的点击回调里删或重建候选对象**：点候选会上屏并刷新候选栏，而此刻那个按钮的事件正在跑，删它（或它父对象的孩子）会崩。所以候选按钮一次建好，之后只改文本/显隐 | `components/pinyin_keyboard/pinyin_keyboard.c` 的 `refresh_bar` |
+| **输入法控件把键盘/输入框指针存在 static 里**：App 的 `leave` 必须调 `pinyin_keyboard_detach()`。忘了不会崩（再 create 会覆盖），但显式 detach 才符合"游离资源 leave 里一个都不能漏"那条纪律 | `components/pinyin_keyboard/pinyin_keyboard.c` |
+| **`lv_obj_get_width()` 读的是"缓存坐标"，不是"你设进去的值"**：刚创建（或刚改过尺寸）、还没经过一次布局的对象，`coords` 全是 0。在 `enter()` 里拿它去定另一个对象的尺寸会得到 **0**，而容器默认裁剪子对象 → **整块东西一片空白**。`lv_obj_pos.h` 的 `@note` 写得很明白："坐标只在下一次重绘时才重算"，绕法是取值前先 `lv_obj_update_layout(obj)`。实测症状极具迷惑性：**敲拼音什么都不显示，但 ASCII 直插照常能用**（那条路不碰出问题的那块）。注意 `lv_obj_align_to()` 内部**会**先刷布局（所以它自己能对齐对），是"在调它之前读坐标"才出事 | `components/pinyin_keyboard/pinyin_keyboard.c` 的 `build_cand_bar` |
 | **二分查到"某一条"不等于查到"第一条"**：词表里同一个音串有**多条**记录（多个同音词，按词频降序连续存放）。二分只保证命中其中之一，落在中间就会让"取前 N 条边"从中间开始数，**把最高频的几个词整个跳过去** —— 症状是整句候选里最常见的那个词反而不出现（实测 `beijing` 出「背景」不出「北京」、`keyi` 出「可疑」不出「可以」）。所以命中后必须退到组头。这个 bug **Python 参考实现抓不到**（它用 dict，天然从组头开始），是设备上的运行期自检抓出来的 | `components/pinyin_engine/pinyin_engine.c` 的 `pinyin_engine_convert` |
 | **pypinyin 取一个字的全部读音要用 `pinyin(c, heteronym=True)[0]`**，写成 `[x[0] for x in pinyin(...)]` 只会拿到**第一个**读音 —— 多音字的次要读音全丢，结果是"谁"打不出 `shei`、"这"打不出 `zhei`、"得"打不出 `dei`（实测少 13 个音节）。返回结构是 `[[读音1, 读音2, ...]]`，一整层才是"这个字的全部读音" | `components/pinyin_engine/scripts/gen_engine_dict.py` 的 `build_syllable_table` |
 | **生成物要 include 对头文件**：维度常量（`PE_WORD_COUNT` 等）在 `pe_dict.h` 里，生成物只引 `pinyin_engine.h` 会编不过（`'PE_WORD_COUNT' undeclared`）。生成脚本的自检已补上这条 —— 第一版自检只数了记录条数，全是数据层面的检查，漏了 include | `components/pinyin_engine/scripts/gen_engine_dict.py` 的 `check_emitted` |
@@ -460,9 +427,9 @@ lv_obj_align_to(cand, kb, LV_ALIGN_OUT_TOP_MID, 0, -8);
 | **缩写键的打包槽数不能用"数据里实际最长键"**：那是 `PE_MAX_ABBR_LEN`（可能小于 4），而打包固定用 4 槽。拿它当槽数会让 C 和 Python 的打包结果错位 —— **简拼全部失灵，而且不报任何错**。C 侧用独立的 `PE_ABBR_SLOTS`、脚本侧用 `ABBR_SLOTS`，两边都有断言守着 | `pinyin_engine.c` 的 `PE_ABBR_SLOTS`；`gen_engine_dict.py` 的 `ABBR_SLOTS` |
 | **自检会写用户表，必须存档还原**：`selftest` 里那段"用户学习"验收会往用户表里塞词，测完要还原，否则**每次开机自检都把用户真实的使用习惯冲掉**。也因此它必须**晚于 `pinyin_learn_init()`** 调用 | `pinyin_engine/selftest.c` 的 `selftest_learn`；`main/main.c` 的调用顺序 |
 | **学习粒度必须是"词"而不是"输入串"**：用户打 `nh` 想要「你好」，而它在候选栏里**根本不存在**（缩写组内排第 9，取不到）—— 他选不到，就永远教不会系统。"输入串 -> 文本"那种整串记忆在这里是死路：它只能记住**本来就能选到**的东西 | `components/pinyin_engine/include/pinyin_engine.h` 的"用户学习"一节 |
-| **拼音写进输入框 = 引入了"记账"问题**：上屏从"追加"变成了"先把末尾那串拼音删掉、再追加汉字"，而四种情况会让 `s_py_len` 这笔账失真（**App 清空过输入框**、用户中途插数字、光标被挪走、退格分两档）。做法是**不维护计数器、每次动手前核对**：`ta_tail_is_pinyin()` 比一下"末尾这几个字节是不是就是 `s_py`"，对不上就当账已过期、只清缓冲不回删。比猜稳得多 | `components/pinyin_input/pinyin_input.c` 的 `ta_tail_is_pinyin` |
+| **拼音写进输入框 = 引入了"记账"问题**：上屏从"追加"变成了"先把末尾那串拼音删掉、再追加汉字"，而四种情况会让 `s_py_len` 这笔账失真（**App 清空过输入框**、用户中途插数字、光标被挪走、退格分两档）。做法是**不维护计数器、每次动手前核对**：`ta_tail_is_pinyin()` 比一下"末尾这几个字节是不是就是 `s_py`"，对不上就当账已过期、只清缓冲不回删。比猜稳得多 | `components/pinyin_keyboard/pinyin_keyboard.c` 的 `ta_tail_is_pinyin` |
 | **`lv_keyboard` 的布局表外部改不了**：`default_kb_map_lc/uc/spec` 和各自的 `ctrl_map` 都是 `lv_keyboard.c` 里的**文件内 static**；`lv_keyboard_get_map_array()` 只能读回 map，**ctrl_map 连读都读不到**（只有 `set`）。所以"想在键面上写个『中』字"做不到 —— 要么整份复制它那套表，要么自己用 `lv_buttonmatrix` 搭。本项目选了后者 | `components/pinyin_keyboard/` 顶部 |
-| **`lv_buttonmatrix_set_map()` 会把 ctrl_map 冲掉**：换布局表会重建按键区域，宽度和 `CHECKED`（灰色底）一起丢。所以**换页/换模式之后必须紧跟一次 `set_ctrl_map()`** —— 顺序反了不崩，只是键宽全变成默认值、灰键变白键 | `components/pinyin_keyboard/pinyin_keyboard.c` 的 `set_page` |
+| **`lv_buttonmatrix_set_map()` 会把 ctrl_map 冲掉**：换布局表会重建按键区域，宽度和 `CHECKED`（灰色底）一起丢。所以**"换 map"和"贴 ctrl_map"必须永远成对做** —— 本项目走 `apply_page()` 一处收口。⚠️ 只在换页时记得、却漏了**改键面文字**那条路（切中/英要把 `中` 换成 `EN`，那也是重设 map）就会踩到：症状是**一切语言，所有键宽退回默认、灰键变白** | `components/pinyin_keyboard/pinyin_keyboard.c` 的 `apply_page` |
 | **布局表里的 `"\n"` 不是按键，但 `"\n"` 之后的按键下标不跳号**：`lv_buttonmatrix_get_button_text()` 内部会自己跳过 `"\n"`，而 `get_selected_button()` 返回的就是**不含 `"\n"`** 的按键下标。所以按键语义的对照表必须按"真按键"建一份，不能直接拿布局表下标去索引 —— 差一个就会认错键（而且只有少数键会错，很难看出来） | `components/pinyin_keyboard/pinyin_keyboard.c` 的 `build_page` |
 | **主题对 `lv_buttonmatrix` 和 `lv_keyboard` 是两套样式**：buttonmatrix 拿到的是"卡片"（圆角+边框），keyboard 拿到的是"屏底色+小内边距"**外加**两条键样式（`bg_color_white`、`keyboard_button_bg`）。所以自己搭的键盘**外观必须显式设**，不能指望主题给成一样的 | `components/pinyin_keyboard/pinyin_keyboard.c` 的 `apply_style` |
 
@@ -472,7 +439,7 @@ demo1 有的、这里已覆盖：桌面、app_manager、相机（+ 拍照存卡�
 
 这里多出来的：`kv_store`、`time_service`、`net_time`（SNTP 对时）、`wifi_service`、`weather_service`（HTTPS + JSON）、全局状态栏、`picture` 图片资源组件、
 **一整套中文输入**（`font_cjk` 中文字体 + `pinyin_engine` 整句/简拼转换引擎 +
-`pinyin_keyboard` 自研键盘 + `pinyin_input` 输入控件 + `pinyin_learn` 用户学习持久化）、
+`pinyin_keyboard` 自研键盘 + `pinyin_learn` 用户学习持久化）、
 Camera 的**录像能力**（`avi_writer` + 常驻录像任务）与相册的**视频播放**（`avi_reader`
 + 同步播放定时器）、Clock / Demo / Settings 三个 App，
 以及**每个 App 的 enter/leave 生命周期与资源回收纪律**

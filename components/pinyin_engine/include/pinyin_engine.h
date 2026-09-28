@@ -150,8 +150,8 @@ void pinyin_engine_user_clear(void);
  *
  * ⚠️ **必须在同一次 `pinyin_engine_convert()` 之后立刻调用，期间不能再调 convert()。**
  *    引擎内部在转换时就把分词拷贝到了 s_trace 里，learn() 只读那份拷贝；但下次 convert()
- *    会覆盖它。调用方（pinyin_input 的 commit()）满足这个条件：它拿到候选后马上 learn，
- *    之后才清空拼音。
+ *    会覆盖它。调用方（pinyin_keyboard 的 commit()）满足这个条件：它拿到候选后马上
+ *    learn，之后才清空拼音。
  *
  * @param[in] idx 候选下标（`pinyin_engine_convert()` 返回列表里的位置）
  */

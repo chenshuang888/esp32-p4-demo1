@@ -9,23 +9,12 @@
  *    联网那条轨道（DeepSeek）以后自带聊天界面，届时把这里的输入区搬过去即可 ——
  *    所以本文件里没有任何一行网络代码，也不需要联网。
  *
- * ⚠️ 工程里有**两套**中文输入法，本 App 用的是**新的那套**：
+ * ⚠️ 中文输入法**只有一套**：`components/pinyin_keyboard`（自研键盘 + 候选栏 +
+ *    输入法逻辑，转换交给 pinyin_engine）。一次 `pinyin_keyboard_create()` 全装好。
  *
- *      新（当前用）  pinyin_keyboard + pinyin_input
- *                    自研键盘 + 自研引擎，整句候选、简拼、数字直选候选、用户学习
- *      旧（兜底保留）pinyin_ime
- *                    薄接入 LVGL 自带的 lv_ime_pinyin，逐字选候选
- *
- *    要切回旧版：**键盘也要一起换回去** —— `pinyin_ime` 要的是 LVGL 自带的
- *    `lv_keyboard`，不是我们自研的这个。具体是把上面那段 `pinyin_kb_create(...)`
- *    换回 `lv_keyboard_create(body)` + `lv_obj_set_size(s_kb, CONTENT_W, KB_H)`，
- *    include 换成 "pinyin_ime.h"，`pinyin_input_attach(s_kb, s_ta)` 换成
- *        s_ime = pinyin_ime_attach(s_kb);
- *        lv_obj_t *cand = lv_ime_pinyin_get_cand_panel(s_ime);
- *        lv_obj_set_size(cand, CONTENT_W, CAND_H);
- *        lv_obj_align_to(cand, s_kb, LV_ALIGN_OUT_TOP_MID, 0, -GAP);
- *    并在 leave 里去掉 pinyin_input_detach()。旧版需要 sdkconfig 里的
- *    CONFIG_LV_USE_IME_PINYIN=y（已开）。**不再是"只改一行"了** —— 因为我们换了键盘。
+ *    工程里曾经还有一版"薄接 LVGL 自带 lv_ime_pinyin"的实现（components/pinyin_ime），
+ *    已经删掉了 —— 它的候选格只有 4 字节、装不下词组，而 lv_keyboard 的布局表又改不了。
+ *    想看那版：`git show 24e039d:components/pinyin_ime/`。踩过的坑留在 README 坑表里。
  *
  * ⚠️ 字号**刻意一处都不设**：中文只有 18px 一档（见 font_cjk.c 的已知限制），
  *    显式设成别的字号会让汉字变成占位方块。不设就继承全局的混排字体，中英混排都对。
@@ -38,40 +27,38 @@
 
 #include "app_manager.h"
 #include "lcd_screen_display.h"     /* LCD_SCREEN_*_RES：算布局 */
-#include "pinyin_input.h"           /* 输入法控件（候选栏高度也在这里） */
-#include "pinyin_keyboard.h"        /* 自研键盘（高度常量、创建接口） */
+#include "pinyin_keyboard.h"        /* 键盘 + 候选栏 + 输入法（高度常量、创建接口） */
 #include "ui_status_bar.h"
 
 static const char *TAG = "ime_test";
 
 /* ---------- 版面 ----------
- * 内容区 552 = 600(屏) - 48(状态栏)，自上而下四块，加法必须对上：
+ * 内容区 552 = 600(屏) - 48(状态栏)，自上而下三块，加法必须对上：
  *
- *     显示区 156   （提交的内容，可纵向滚动）
+ *     显示区 164   （提交的内容，可纵向滚动）
  *     间距    8
  *     输入框  48   lv_textarea
  *     间距    8
- *     候选栏  44   **由 pinyin_input 建并摆在键盘正上方**，这里只预留高度
- *     间距    8
- *     键盘   280   **自研键盘**（components/pinyin_keyboard），5 行
+ *     候选栏  44 ┐ 都由 pinyin_keyboard 一起建、一起摆
+ *     键盘   280 ┘ （= PINYIN_KEYBOARD_TOTAL_H，324）
  *     --------------------------------
  *     合计   552
  *
  * 改任何一个数字都要重新对一遍这个加法，否则会溢出屏幕或被截掉（同 desktop.c 的纪律）。
- * 候选栏高度用 PINYIN_INPUT_BAR_H、键盘高度用 PINYIN_KB_HEIGHT 而**不是**写死数字
- * —— 它们的尺寸/位置由各自的控件自己算，App 这边写死别的数就会错位。
+ * 高度一律用宏（PINYIN_KEYBOARD_TOTAL_H / PINYIN_KEYBOARD_HEIGHT）而**不是**写死数字
+ * —— 键盘和候选栏的尺寸是那个组件自己算的，App 这边写死别的数就会错位。
  *
- * ⚠️ 这里**刻意不用 flex 布局**：候选栏的位置是控件用 lv_obj_align_to(bar, kb, ...)
- *    算的，而 flex 容器会接管子对象的位置、把 align 覆盖掉 —— 两者混用是
- *    "不崩，但布局全错"。所以四块全部用显式 align。 */
+ * ⚠️ **不要 align 键盘**：它和候选栏是一体的，位置由 pinyin_keyboard 自己摆
+ *    （贴 body 底部）。App 再 align 一次，候选栏不会跟着走（它是一次性相对对齐算的）。
+ * ⚠️ 这里也**刻意不用 flex 布局**：候选栏的位置是组件内部用 lv_obj_align_to() 算的，
+ *    而 flex 容器会接管子对象的位置、把 align 覆盖掉 —— 两者混用是"不崩，但布局全错"。 */
 #define PAD        16
 #define GAP         8
 #define TA_H       48
-#define CAND_H     PINYIN_INPUT_BAR_H
-#define KB_H       PINYIN_KB_HEIGHT
-#define CONTENT_H (LCD_SCREEN_V_RES - UI_STATUS_BAR_HEIGHT)         /* = 552 */
-#define CONTENT_W (LCD_SCREEN_H_RES - PAD * 2)                      /* = 992 */
-#define SHOW_H    (CONTENT_H - KB_H - CAND_H - TA_H - GAP * 3)      /* = 156 */
+#define KB_H       PINYIN_KEYBOARD_HEIGHT
+#define CONTENT_H (LCD_SCREEN_V_RES - UI_STATUS_BAR_HEIGHT)                  /* = 552 */
+#define CONTENT_W (LCD_SCREEN_H_RES - PAD * 2)                               /* = 992 */
+#define SHOW_H    (CONTENT_H - PINYIN_KEYBOARD_TOTAL_H - TA_H - GAP * 2)     /* = 164 */
 
 static lv_obj_t *s_scr        = NULL;
 static lv_obj_t *s_show_label = NULL;   /* 大字区里那个会自动换行的 label */
@@ -79,11 +66,10 @@ static lv_obj_t *s_ta         = NULL;
 static lv_obj_t *s_kb         = NULL;
 
 /*
- * 键盘上的 OK 键 = 提交。
+ * 提交 = 按键盘上的回车键。
  *
- * 键盘默认回调在 LV_SYMBOL_OK 上会把 LV_EVENT_READY **先发给键盘自己**、再发给 textarea
- * （即使没绑 textarea，发给键盘那一步也照发），所以把回调挂在键盘上就能收到。
- * 输入法还把"换行键"也接到了同一个事件上（见 pinyin_input.c），所以两个键都能提交。
+ * 键盘本身不认识"提交" —— 它按到 ↵ 只报一个语义，是 pinyin_keyboard 往**键盘对象**上
+ * 补发一个 LV_EVENT_READY，所以把回调挂在键盘上就能收到。
  *
  * ⚠️ 不要在这里加 LVGL 锁：事件回调本来就跑在 LVGL 任务里、锁已持有。
  */
@@ -98,9 +84,9 @@ static void on_submit(lv_event_t *e)
 
     lv_label_set_text(s_show_label, txt);
     /* ⚠️ 先 reset 再清空：reset 会把框里**还没上屏的那串拼音字母**删掉
-     * （拼音现在写在输入框里，不是单独的回显了）。顺序反了也不会出错 ——
-     * reset 会自己核对账，但先 reset 语义更清楚。 */
-    pinyin_input_reset();
+     * （拼音是写在输入框里的）。顺序反了也不会出错 —— reset 会自己核对账，
+     * 但先 reset 语义更清楚。 */
+    pinyin_keyboard_reset();
     lv_textarea_set_text(s_ta, "");     /* 清空，接着测下一次 */
 }
 
@@ -151,23 +137,14 @@ static void ime_test_enter(void)
     lv_obj_set_size(s_ta, CONTENT_W, TA_H);
     lv_obj_align(s_ta, LV_ALIGN_TOP_LEFT, 0, SHOW_H + GAP);
 
-    /* 键盘：用**自研的**（components/pinyin_keyboard）。它和 LVGL 自带的那个相比：
-     *   - **数字行常驻**，而且有候选时数字键 = 直选第 N 个候选
-     *   - 左下角是中/英切换键，键面直接写当前模式（"中" / "EN"）
-     *   - 去掉了对中文没用的 `_` `-` `:` `←` `→`
-     * 布局/分页/中英模式由键盘自己管，这里只要给个尺寸 —— 不再需要 set_mode/set_map。 */
-    s_kb = pinyin_kb_create(body, CONTENT_W, KB_H);
-    lv_obj_align(s_kb, LV_ALIGN_BOTTOM_LEFT, 0, 0);
-    /* 回车 = 提交。键盘本身不认识"提交"，是 pinyin_input 收到回车键后往键盘对象上
-     * 补发一个 LV_EVENT_READY —— 所以这里监听的写法和以前用 lv_keyboard 时一样。 */
+    /* 键盘 + 候选栏 + 输入法：**一次装好**（components/pinyin_keyboard）。
+     * 和 LVGL 自带的键盘相比：数字行常驻（有候选时数字键 = 直选第 N 个候选）、
+     * 左下角是中/英切换键（键面直接写当前模式）、去掉了对中文没用的 _ - : ← →。
+     * ⚠️ 键盘和候选栏是一体的，位置由它自己摆（贴 body 底部）—— 这里不要再 align。 */
+    s_kb = pinyin_keyboard_create(body, s_ta, CONTENT_W, KB_H);
+    /* 回车 = 提交。键盘本身不认识"提交"，是本组件收到回车键后往键盘对象上补发一个
+     * LV_EVENT_READY —— 所以这里监听的写法一直没变。 */
     lv_obj_add_event_cb(s_kb, on_submit, LV_EVENT_READY, NULL);
-
-    /* 挂输入法：它接管键盘的字符输入，并在键盘正上方建候选栏。
-     * 拼音字母是直接打在输入框里的（不是单独的回显），所以 s_ta 的内容由它管。
-     * ⚠️ 必须在键盘**尺寸定好之后** —— 候选栏要照键盘的宽度摆。 */
-    if (pinyin_input_attach(s_kb, s_ta) != ESP_OK) {
-        ESP_LOGE(TAG, "输入法没挂上 —— 这个 App 就只能输 ASCII 了");
-    }
 
     lv_screen_load(s_scr);
     lvgl_port_unlock();
@@ -179,11 +156,11 @@ static void ime_test_leave(void)
 
     lvgl_port_lock(0);
 
-    /* 先解除挂接：输入法把键盘/输入框/候选栏的指针存在 static 里，
-     * 不告诉它就把 screen 删了，下次 enter 再挂时会指着一堆已释放的对象。
+    /* 先解挂：它把键盘/输入框/候选栏的指针存在 static 里，不告诉它就把 screen 删了，
+     * 下次 enter 再建时会指着一堆已释放的对象。顺带把学习记录落盘。
      * （那些对象本身不用在这里删 —— 它们是 screen 的子孙，跟着一起释放。）
      * 本 App 没有别的游离资源（没有 lv_timer），所以到这里就干净了。 */
-    pinyin_input_detach();
+    pinyin_keyboard_detach();
 
     lv_obj_delete_async(s_scr);
     s_scr = NULL;
