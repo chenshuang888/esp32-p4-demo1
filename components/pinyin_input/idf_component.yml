@@ -1,0 +1,6 @@
+## IDF Component Manager Manifest File
+## 拼音输入法控件：候选栏是 LVGL 对象、拼音回显是 label，所以依赖 lvgl
+## （转换引擎 pinyin_engine 是自家组件，写在 CMakeLists 的 REQUIRES 里）
+dependencies:
+  idf: ">=5.3"
+  lvgl/lvgl: "~9.5.0"

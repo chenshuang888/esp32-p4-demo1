@@ -1,0 +1,6 @@
+## IDF Component Manager Manifest File
+## 自研键盘：整块是 LVGL 的 buttonmatrix，所以依赖 lvgl。
+## （它不认识拼音引擎、也不认识输入框，所以 REQUIRES 里没有自家组件。）
+dependencies:
+  idf: ">=5.3"
+  lvgl/lvgl: "~9.5.0"

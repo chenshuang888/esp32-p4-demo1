@@ -22,6 +22,7 @@
 #include "photo.h"
 #include "settings.h"
 #include "weather.h"
+#include "ime_test.h"
 #include "time_service.h"
 #include "kv_store.h"
 #include "sd_card.h"
@@ -29,6 +30,8 @@
 #include "net_time.h"
 #include "weather_service.h"
 #include "font_cjk.h"
+#include "pinyin_engine.h"
+#include "pinyin_learn.h"
 
 static const char *TAG = "app";
 
@@ -117,6 +120,13 @@ void app_main(void)
         ESP_LOGW(TAG, "SD 卡未挂载，文件功能不可用");
     }
 
+    /* 输入法的"用户学习"记录：从 SD 卡读回来、灌给拼音引擎。
+     * ⚠️ 必须紧跟 sd_card_init() —— 它要读的文件在卡上。
+     * 读不到（首次运行 / 没插卡）不是错误：空表起步，本次开机内的学习照常生效
+     * （只是不持久化），下次退出 App 时若写得了卡再存。
+     * 和 wifi_service 收凭据是同一个模式：引擎不认识存储，由 main 这里组装。 */
+    pinyin_learn_init();
+
     /* WiFi：由板载 ESP32-C6 协处理器提供（P4 通过 SDIO 与它通信）。
      * 同样**非阻塞 + 失败不 panic** —— 网络是外设，不该决定能不能开机。
      * 连上与否看 wifi_service 打的日志（"拿到 IP: ..."）。
@@ -183,6 +193,20 @@ void app_main(void)
 
     time_service_init();
 
+    /* 拼音引擎自检：拿固定用例跑一遍 DP，日志里报命中数。三段 —— 全拼（预期 28/30）、
+     * 简拼（预期 12/12）、以及"用户学习"的闭环验收（学之前简拼打不出「你好」、
+     * 学之后能打出来）。用例表和生成脚本里那份是同一份，两边对不上就说明移植出了问题。
+     *
+     * 为什么放这儿而不是做成单元测试：这台机器上**没有任何 host 编译器**
+     * （gcc/clang/cc 全无），工程也从来没有过 host 测试的先例 —— 所以改成
+     * 运行期自检，一次烧录就能验收算法。
+     *
+     * ⚠️ **必须晚于上面的 pinyin_learn_init()**：学习那段验收会往用户表里写东西，
+     *    它靠"存档 / 还原"来避免污染用户数据 —— 换言之它只能保住"调用那一刻"的内容，
+     *    早于载入调用的话，等载入完就把自检的痕迹一起盖进去了（顺序其实也无害，
+     *    但那样"还原"就名不副实）。纯计算、不碰硬件，失败也不影响启动，所以不判返回值。 */
+    pinyin_engine_selftest();
+
     /* 对时：时间源是 SNTP（net_time 组件）。它已经在上面 WiFi 块里配置好，
      * 并挂在"拿到 IP"钩子上 —— 连上网络的那一刻就会把时间喂进来。
      * 所以这里不需要再做任何事（原来那行硬编码的假时间已删掉）。
@@ -200,6 +224,7 @@ void app_main(void)
     photo_register();
     settings_register();
     weather_register();
+    ime_test_register();
 
     /* ---- 4. UI 层：接入 LVGL ---- */
     ESP_ERROR_CHECK(ui_init());

@@ -112,6 +112,47 @@ CONFIG_LV_FONT_MONTSERRAT_48=y
 CONFIG_LV_USE_FONT_COMPRESSED=y
 CONFIG_LV_FONT_FMT_TXT_LARGE=y
 
+# ---- 拼音输入法（components/pinyin_ime）需要的三项 ----
+#
+# 用的是 **LVGL 9.5 自带的** lv_ime_pinyin（src/widgets/ime/lv_ime_pinyin.c），不是自研。
+# 它自带拼音缓冲、退格、候选栏、`<` `>` 翻页、"点候选替换 textarea 里的拼音"，
+# 我们只提供词典（components/pinyin_ime/dicts/lv_pinyin_dict.c，由脚本生成）。
+# 但它默认是关的 —— Kconfig 里那个 bool 的 default 就是 n。
+#
+# 1) LV_USE_IME_PINYIN —— 总开关，不开则 lv_ime_pinyin_* 全套 API 都不存在
+#
+# 2) LV_IME_PINYIN_USE_DEFAULT_DICT=n —— 关掉内置词典
+#    内置词典有 ~400 条，而且**是繁体**（lv_ime_pinyin_def_dict 里形如
+#    {"ai", "愛"}、{"bai", "百白敗"}）。我们要简体 + 覆盖《通用规范汉字表》
+#    全表 + 候选按字频排序，所以运行时用 lv_ime_pinyin_set_dict() 换成自己的。
+#    关掉而不是留着，有两个理由：
+#      a) 省约 12KB 固件 —— 留着它也只会被 set_dict 覆盖，永远用不上；
+#      b) **故障可见**：万一 set_dict 没调成功，关掉的表现是"一个候选都没有"，
+#         一眼看出不对；留着则表现为"候选全是繁体字"，很容易当成字体问题查错方向。
+#    ⚠️ 代价：词典必须在 lv_ime_pinyin_create() 之后**立刻** set 进去。
+#       这一条由 components/pinyin_ime 的 pinyin_ime_attach() 保证，别绕过它。
+#
+# 3) LV_IME_PINYIN_CAND_TEXT_NUM=9 —— 候选栏每页显示几个字
+#    LVGL 默认 6。屏幕宽 1024，候选栏是整行 buttonmatrix，9 个候选 + 首尾的
+#    `<` `>` 共 11 格，每格约 93px，18px 汉字放得下且不挤。
+#    为什么需要更多：本词典不设候选数上限，最长的音节 `yi` 有 176 个候选 ——
+#    每页 6 个要翻 30 页，9 个降到 20 页。真正解决问题的是**字频排序**
+#    （见 pinyin_ime/scripts/gen_pinyin_dict.py），这个数字只是辅助。
+#
+# 4) LV_IME_PINYIN_USE_K9_MODE 保持默认的 n（这里不写）—— 不用九宫格输入。
+#    ⚠️ 但它带来一个必须处理的坑：键盘左下角那个 LV_SYMBOL_KEYBOARD 键会被 IME
+#       当成"切 K9/26 键模式"，而 lv_ime_pinyin_set_mode() 里改模式那行是**无条件**
+#       执行的、换键盘布局那段却被 #if LV_IME_PINYIN_USE_K9_MODE 包着 —— 于是
+#       关掉 K9 时按它会变成"模式是 K9、键盘还是 K26"，**之后所有字母都进不了候选**，
+#       输入法静默失效。绕法写在 components/pinyin_ime/pinyin_ime.c。
+#
+# ⚠️ 这三项在现有 sdkconfig 里已是 "# ... is not set"（LV_USE_IME_PINYIN 那条在
+#    sdkconfig:2907），而 defaults 只对"尚未出现"的符号生效 ——
+#    **所以改完必须删掉 sdkconfig 重新生成**（同上面字体那段的说明）。
+CONFIG_LV_USE_IME_PINYIN=y
+CONFIG_LV_IME_PINYIN_USE_DEFAULT_DICT=n
+CONFIG_LV_IME_PINYIN_CAND_TEXT_NUM=9
+
 
 # ---- USB Host（USB 摄像头 / UVC 需要）----
 # 这两项是 UVC 能不能工作的**前提**，不是调优项：

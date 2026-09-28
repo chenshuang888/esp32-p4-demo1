@@ -32,6 +32,7 @@
 #include "kv_store.h"
 #include "lcd_screen_display.h"
 #include "picture.h"
+#include "pinyin_learn.h"
 #include "ui_status_bar.h"
 #include "wifi_service.h"
 
@@ -318,6 +319,29 @@ static void on_wifi_row_clicked(lv_event_t *e)
     wifi_start_scan();
 }
 
+/*
+ * 点 P1 的 "Clear learned words"：清掉输入法的用户学习记录（内存表 + SD 卡上的文件）。
+ *
+ * 这条是**必要的出口**：学习表会"脏"（误选一次，那个词就被顶到前面，而且很难自己掉下去），
+ * 没有清空入口的话输入法会越用越坏。见 components/pinyin_learn/。
+ *
+ * 顺手把按钮文字改掉当作反馈 —— 这个 App 的点击回调里不删任何对象（见文件头那条纪律），
+ * 只改文本是安全的。
+ */
+static void on_clear_learn_clicked(lv_event_t *e)
+{
+    pinyin_learn_clear();
+
+    lv_obj_t *btn = lv_event_get_target_obj(e);
+    lv_obj_t *lb  = lv_obj_get_child(btn, 0);
+    /* 只认 label：列表行的第一个子对象理论上就是它（icon 传的是 NULL），
+     * 但类型不对时宁可不改，也不要往别的控件上乱设文本。 */
+    if (lb != NULL && lv_obj_check_type(lb, &lv_label_class)) {
+        lv_label_set_text(lb, "Learned words cleared");
+    }
+    ESP_LOGI(TAG, "已清除输入法的用户学习记录");
+}
+
 /* ===================== P3：密码输入 ===================== */
 
 static void on_up_to_wifi(lv_event_t *e)
@@ -353,10 +377,15 @@ static void build_root_page(void)
     lv_obj_set_size(list, 420, LV_SIZE_CONTENT);
     lv_obj_align(list, LV_ALIGN_TOP_LEFT, 0, 0);
 
-    /* 目前只有一项 —— 点进去是 WiFi 列表。以后加设置项就往这个列表里继续
-     * add_button，页面本身和页面切换都不用动。 */
+    /* 目前只有两项。以后加设置项就往这个列表里继续 add_button，
+     * 页面本身和页面切换都不用动。 */
     lv_obj_t *wifi_row = lv_list_add_button(list, NULL, "WiFi");
     lv_obj_add_event_cb(wifi_row, on_wifi_row_clicked, LV_EVENT_CLICKED, NULL);
+
+    /* 输入法的用户学习记录（components/pinyin_learn）。学到的词存在 SD 卡上，
+     * 这里给一条"清除"的出路 —— 误选的词会被顶到候选前面，没有出口就下不来了。 */
+    lv_obj_t *learn_row = lv_list_add_button(list, NULL, "Clear learned words");
+    lv_obj_add_event_cb(learn_row, on_clear_learn_clicked, LV_EVENT_CLICKED, NULL);
 }
 
 static void build_wifi_page(void)
