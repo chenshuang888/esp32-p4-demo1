@@ -64,6 +64,14 @@ components/
                      自带常驻 worker 任务，**不认识 LVGL / wifi / time_service**
                      —— 时区交给请求里的 timezone=auto，由服务器换算成当地时间；
                      见坑表里"TLS 不能跑在 LVGL 任务里"）
+  llm_client/        能力：大模型对话（HTTPS POST DeepSeek 的 OpenAI 兼容接口，**流式 SSE**；
+                     自带常驻 worker 任务，模型/任务模型都照 weather_service 搭，
+                     但响应是**流式**的：SSE 逐行解析、正文边收边攒，
+                     另有 `llm_client_copy_text()` 供 App 在生成过程中刷新屏幕。
+                     **多轮上下文**：历史由**调用方持有**，每次请求把整段历史拷走重新拼
+                     （服务端无状态，这是协议要求）—— 组件自己不记任何会话状态。
+                     ⚠️ **没有"取消"**（这个 IDF 版本没有可靠的中断手段，见坑表）。
+                     测试期 API Key 写死在本组件 .c 顶部，**提交前删掉**）
   sd_card/           能力：SD 卡挂载（之后用 POSIX 文件 API）
   frame_buf/         能力：双缓冲原语（丢旧保新 + 读槽占用保护）
   jpeg_decoder/      能力：JPEG → RGB565（**同步一次性**；输入是裸指针，不认识 frame_buf）
@@ -134,6 +142,7 @@ components/
 | Settings | `apps/settings.c` | 设置：设置列表（WiFi / **Clear learned words**）→（点 WiFi）WiFi 列表（扫描，按信号从强到弱排）→（点某个 SSID）输密码 → 连接。凭据存 NVS，开机由 main 读出来自动连。验证"扫描 → 选网 → 输密码 → 连上"整条链路 |
 | Weather | `apps/weather.c` | 天气（手机风格）：左栏 hero（地点 + 48 号大温度 + 天气文字 + 大图标）+ 体感/湿度/风，右栏 24 小时横滑条 + 7 日预报；Refresh 按钮。验证"HTTPS 客户端 + 根证书包 + JSON 解析"整条链路；App 侧**一行网络代码都没有**，全在 weather_service 的常驻任务里。时区用请求里的 `timezone=auto` 让服务器换算，所以**不依赖 time_service**。天气图标为位图，WMO 码归成 12 类 × 96/32 两档（雨刻意分小雨/中雨/大雨），见 `components/picture/picture.h` |
 | IME Test | `apps/ime_test.c` | **验证台**（不是给用户用的功能）：自研键盘 + 输入框 + 整句拼音输入法（支持**简拼**），连打拼音 → 点候选 / 按空格 / **按数字 1-9 直选** → 回车提交到大字区。左下角键切**中/英**。选中的候选会被**学习**（下次提前）。验证"屏上能打出中文且渲染正确"这一条链路。零网络依赖，见"中文输入"一节 |
+| AI Chat | `apps/ai_chat.c` | **测试版**的对话 App：屏上打中文 → 回车发送 → 大模型回复**流式**显示在聊天区（首字约 0.5~0.8 秒出现，之后边生成边刷；实测生成约 235 字/秒，所以 2000 字能省下 8~10 秒的干等）。验证"中文输入 + HTTPS POST + SSE 流式解析 + 上屏"整条链路，App 侧**一行网络代码都没有**（全在 `llm_client` 的常驻任务里）。键盘**按需弹出**（点输入框展开、点聊天区收起、发送后自动收起）。**支持多轮上下文**：整段历史由 App 持有、每轮全量重发（服务端无状态）；请求失败会**回滚**用户那句，保证 user/assistant 交替；**退出 App 即结束本次对话**，另有「新对话」按钮随时清空。⚠️ **没有"停止生成"**（生成中发送/新对话都会被忽略）。刻意不做：Markdown、历史落盘、气泡美化 |
 
 ## 加一个 App 的步骤
 
@@ -417,6 +426,12 @@ a s d f g h j k l
 | **转换引擎的路径表不能放栈上**（约 14KB）：调用方是 LVGL 任务，它的栈只有 7168B。所以放文件级 static，代价是函数不可重入 | `components/pinyin_engine/pinyin_engine.c` 顶部 |
 | **不能在候选按钮的点击回调里删或重建候选对象**：点候选会上屏并刷新候选栏，而此刻那个按钮的事件正在跑，删它（或它父对象的孩子）会崩。所以候选按钮一次建好，之后只改文本/显隐 | `components/pinyin_keyboard/pinyin_keyboard.c` 的 `refresh_bar` |
 | **输入法控件把键盘/输入框指针存在 static 里**：App 的 `leave` 必须调 `pinyin_keyboard_detach()`。忘了不会崩（再 create 会覆盖），但显式 detach 才符合"游离资源 leave 里一个都不能漏"那条纪律 | `components/pinyin_keyboard/pinyin_keyboard.c` |
+| **想让键盘"按需弹出"，必须把键盘和候选栏**整块**藏**：候选栏的句柄没对外暴露，单独隐藏键盘对象会让候选栏孤零零留在屏上。做法是给两者套一个可隐藏的 holder（`pinyin_keyboard_create(holder, ...)`），隐藏 holder 两个一起消失 —— 但 holder 必须有**确定的高度**（= `PINYIN_KEYBOARD_TOTAL_H`），因为候选栏是相对键盘"贴正上方"定位的，高度不对它就跑到 holder 外面去了 | `apps/ai_chat.c` 顶部版面说明 |
+| **服务端是无状态的：每次请求都要把整段历史重发** —— 这是协议要求（Anthropic 官方文档原话 "you always send the full conversational history"），不是客户端偷懒。但**重发的那段历史 ≠ 模型的上下文窗口**：窗口（DeepSeek 现在是 1M）是"单次请求最多能装多少"的**上限**，实际发多少完全由客户端决定，纯文本对话只有几 KB。把这两个量混起来会得出两种都错的结论 —— "反正装得下所以不用管" / "怕撑爆所以要裁到几条"。真正会咬人的约束在**设备侧**：body 要经 TLS 上行、过 C6 那条 SDIO，只有发图片那种 100KB 级的 body 才会成为问题 | `components/llm_client/llm_client.c` 顶部；`apps/ai_chat.c` 的历史管理 |
+| **HTTP 的块边界和 SSE 的行边界没有任何关系**：一次 `HTTP_EVENT_ON_DATA` 可能只给**半行**（`data: {"choices":[{"del`），剩下半行在下一片里。所以流式解析**不能**"来一片就 `cJSON_Parse` 一次"，必须跨回调攒行、见到 `\n` 才当一整行。这是流式输出唯一真正的坑 | `components/llm_client/llm_client.c` 的 `sse_feed` |
+| **流式片里增量在 `choices[0].delta.content`，非流式才是 `message.content`** —— 两个字段名不一样，改流式时最容易拿错 | `components/llm_client/llm_client.c` 的 `sse_line` |
+| **"事件回调返回 `ESP_FAIL` 就能中断 `esp_http_client_perform()`"是过期的说法**：在 ESP-IDF 5.4.3 里 `http_dispatch_event()` 的返回值**在所有调用点都被丢弃**（`esp_http_client.c:330` 的 `ON_DATA` 也一样），根本没人看。这个版本也没有 `abort` / `perform_async`，只有 `esp_http_client_close()/cleanup()`，且头文件**没有线程安全承诺** —— 所以想从另一个任务硬关连接有崩溃风险。**结论：本项目不做"取消/停止"** | `components/esp_http_client/esp_http_client.c` 的 `http_event_cb` 调用点 |
+| **流式的下行字节数会放大 25~60 倍**：每个 chunk 都把 `id`/`model`/`system_fingerprint` 整个信封重发一遍，而每 ~1.6 个字就发一个 chunk。实测 2000 字 = **440KB** 下行（内容本身才 ~7KB）。对 PC 无所谓，对设备是要过 C6 SDIO 的量 | `components/llm_client/llm_client.c` 顶部"流式输出"一节 |
 | **`lv_obj_get_width()` 读的是"缓存坐标"，不是"你设进去的值"**：刚创建（或刚改过尺寸）、还没经过一次布局的对象，`coords` 全是 0。在 `enter()` 里拿它去定另一个对象的尺寸会得到 **0**，而容器默认裁剪子对象 → **整块东西一片空白**。`lv_obj_pos.h` 的 `@note` 写得很明白："坐标只在下一次重绘时才重算"，绕法是取值前先 `lv_obj_update_layout(obj)`。实测症状极具迷惑性：**敲拼音什么都不显示，但 ASCII 直插照常能用**（那条路不碰出问题的那块）。注意 `lv_obj_align_to()` 内部**会**先刷布局（所以它自己能对齐对），是"在调它之前读坐标"才出事 | `components/pinyin_keyboard/pinyin_keyboard.c` 的 `build_cand_bar` |
 | **二分查到"某一条"不等于查到"第一条"**：词表里同一个音串有**多条**记录（多个同音词，按词频降序连续存放）。二分只保证命中其中之一，落在中间就会让"取前 N 条边"从中间开始数，**把最高频的几个词整个跳过去** —— 症状是整句候选里最常见的那个词反而不出现（实测 `beijing` 出「背景」不出「北京」、`keyi` 出「可疑」不出「可以」）。所以命中后必须退到组头。这个 bug **Python 参考实现抓不到**（它用 dict，天然从组头开始），是设备上的运行期自检抓出来的 | `components/pinyin_engine/pinyin_engine.c` 的 `pinyin_engine_convert` |
 | **pypinyin 取一个字的全部读音要用 `pinyin(c, heteronym=True)[0]`**，写成 `[x[0] for x in pinyin(...)]` 只会拿到**第一个**读音 —— 多音字的次要读音全丢，结果是"谁"打不出 `shei`、"这"打不出 `zhei`、"得"打不出 `dei`（实测少 13 个音节）。返回结构是 `[[读音1, 读音2, ...]]`，一整层才是"这个字的全部读音" | `components/pinyin_engine/scripts/gen_engine_dict.py` 的 `build_syllable_table` |
@@ -441,9 +456,12 @@ demo1 有的、这里已覆盖：桌面、app_manager、相机（+ 拍照存卡�
 **一整套中文输入**（`font_cjk` 中文字体 + `pinyin_engine` 整句/简拼转换引擎 +
 `pinyin_keyboard` 自研键盘 + `pinyin_learn` 用户学习持久化）、
 Camera 的**录像能力**（`avi_writer` + 常驻录像任务）与相册的**视频播放**（`avi_reader`
-+ 同步播放定时器）、Clock / Demo / Settings 三个 App，
++ 同步播放定时器）、Clock / Demo / Settings / AI Chat 四个 App，
 以及**每个 App 的 enter/leave 生命周期与资源回收纪律**
 （demo1 的 App 是 `create_screen/destroy_screen`，没有回收约定）。
+
+大模型对话那条链路是 demo1 完全没有的：`llm_client`（POST DeepSeek，
+任务模型照 `weather_service` 搭）+ `apps/ai_chat.c`（中文输入 + 聊天区）。
 
 demo1 里有、这里**还没做**的：画板 App（`demo1/app/app_paint.c`）。
 移植时唯一要小心的是画布缓冲区（PSRAM）的释放时机 —— 这里删 screen 是异步的，

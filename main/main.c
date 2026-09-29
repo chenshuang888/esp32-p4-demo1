@@ -23,12 +23,14 @@
 #include "settings.h"
 #include "weather.h"
 #include "ime_test.h"
+#include "ai_chat.h"
 #include "time_service.h"
 #include "kv_store.h"
 #include "sd_card.h"
 #include "wifi_service.h"
 #include "net_time.h"
 #include "weather_service.h"
+#include "llm_client.h"
 #include "font_cjk.h"
 #include "pinyin_engine.h"
 #include "pinyin_learn.h"
@@ -179,6 +181,17 @@ void app_main(void)
         ESP_LOGW(TAG, "天气能力未就绪（App 仍会注册，进去只显示不可用）");
     }
 
+    /* 大模型对话能力：同样是**常驻 worker 任务**（栈 8192，理由同 weather_service
+     * —— LVGL 任务栈只有 7168，放不下 TLS 握手）。
+     * 这里只建任务、不发请求：请求由 AI Chat App 的发送动作触发。
+     * 失败也不 panic（App 进去会提示"对话服务未就绪"）。
+     * ⚠️ 它和 weather_service 各自持有一条 HTTPS 连接是允许的，但**别同时压满**
+     *    （两条 TLS 同时在跑会占满 C6 那条 SDIO 的吞吐）—— 目前不会，因为
+     *    天气只在进 App 时拉一次。 */
+    if (llm_client_init() != ESP_OK) {
+        ESP_LOGW(TAG, "大模型对话能力未就绪（App 仍会注册，进去发不出消息）");
+    }
+
     /* ---- 相机链路：USB Host + UVC 驱动 + 拍照保存任务 ----
      * 由 camera App 提供，但属于"能力就位"阶段：必须在注册 App 之前完成。
      * 这里建的两样都**常驻**（进出 App 不重建）：
@@ -225,6 +238,7 @@ void app_main(void)
     settings_register();
     weather_register();
     ime_test_register();
+    ai_chat_register();
 
     /* ---- 4. UI 层：接入 LVGL ---- */
     ESP_ERROR_CHECK(ui_init());

@@ -33,5 +33,5 @@
     "board/esp32p4-builtin.cfg"
   ],
   "idf.flashType": "UART",
-  "idf.portWin": "COM8"
+  "idf.port": "COM8"
 }
